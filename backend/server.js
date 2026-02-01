@@ -22,6 +22,7 @@ const systemRoutes = require("./routes/system");
 const reviewsRouter = require("./routes/reviews");
 const slotsRoutes = require("./routes/slots");
 const aiRoutes = require("./routes/ai");
+const { runBookingMaintenanceJobs } = require("./scheduledBookingsJob");
 
 app.use("/api/auth", authRoutes);
 app.use("/api/spots", spotsRoutes);
@@ -167,4 +168,10 @@ server.listen(PORT, () => {
   console.log(`🔌 Socket.IO ready for real-time updates`);
   console.log(`🎥 Camera worker system enabled`);
   console.log("=".repeat(60));
+
+  // Start background job for scheduled bookings
+  console.log("⏰ Starting scheduled bookings maintenance job...");
+  runBookingMaintenanceJobs(); // Run immediately on startup
+  setInterval(runBookingMaintenanceJobs, 60000); // Run every minute
+  console.log("✅ Background job started - checking every 60 seconds");
 });

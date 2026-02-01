@@ -65,159 +65,182 @@ router.post("/reserve/:parking_id", auth(["user"]), (req, res) => {
       });
     }
 
-    // Find an available slot
+    // Convert startAt to MySQL format - CORRECTLY preserving local timezone
+    const year = startAt.getFullYear();
+    const month = String(startAt.getMonth() + 1).padStart(2, "0");
+    const day = String(startAt.getDate()).padStart(2, "0");
+    const hours = String(startAt.getHours()).padStart(2, "0");
+    const minutes = String(startAt.getMinutes()).padStart(2, "0");
+    const seconds = String(startAt.getSeconds()).padStart(2, "0");
+    const startAtSql = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+
+    // Calculate end time for overlap checking
+    const endAt = new Date(startAt.getTime() + duration_minutes * 60000);
+    const endYear = endAt.getFullYear();
+    const endMonth = String(endAt.getMonth() + 1).padStart(2, "0");
+    const endDay = String(endAt.getDate()).padStart(2, "0");
+    const endHours = String(endAt.getHours()).padStart(2, "0");
+    const endMinutes = String(endAt.getMinutes()).padStart(2, "0");
+    const endSeconds = String(endAt.getSeconds()).padStart(2, "0");
+    const endAtSql = `${endYear}-${endMonth}-${endDay} ${endHours}:${endMinutes}:${endSeconds}`;
+
+    // Find an available slot that doesn't have conflicting future bookings
     const findSlotQuery = `
-      SELECT id, slot_number
-      FROM parking_slots
-      WHERE parking_spot_id = ?
-        AND is_active = 1
-        AND is_available = 1
-      ORDER BY slot_number ASC
+      SELECT ps.id, ps.slot_number
+      FROM parking_slots ps
+      WHERE ps.parking_spot_id = ?
+        AND ps.is_active = 1
+        AND ps.is_available = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM bookings b
+          WHERE b.slot_id = ps.id
+            AND b.status = 'active'
+            AND (
+              (b.start_at < ? AND b.expires_at > ?)
+              OR (b.start_at >= ? AND b.start_at < ?)
+            )
+        )
+      ORDER BY ps.slot_number ASC
       LIMIT 1
     `;
 
-    db.query(findSlotQuery, [parking_id], (err2, slotResult) => {
-      if (err2) return res.status(500).json({ error: err2.message });
+    db.query(
+      findSlotQuery,
+      [parking_id, endAtSql, startAtSql, startAtSql, endAtSql],
+      (err2, slotResult) => {
+        if (err2) return res.status(500).json({ error: err2.message });
 
-      if (!slotResult.length) {
-        return res.status(400).json({
-          message: "No available slots found. Please try again.",
-        });
-      }
+        if (!slotResult.length) {
+          return res.status(400).json({
+            message: "No available slots found for the requested time period.",
+          });
+        }
 
-      const slot = slotResult[0];
-      const total_price = +(spot.price * (duration_minutes / 60)).toFixed(2);
+        const slot = slotResult[0];
+        const total_price = +(spot.price * (duration_minutes / 60)).toFixed(2);
 
-      // Convert startAt to MySQL format - CORRECTLY preserving local timezone
-      const year = startAt.getFullYear();
-      const month = String(startAt.getMonth() + 1).padStart(2, "0");
-      const day = String(startAt.getDate()).padStart(2, "0");
-      const hours = String(startAt.getHours()).padStart(2, "0");
-      const minutes = String(startAt.getMinutes()).padStart(2, "0");
-      const seconds = String(startAt.getSeconds()).padStart(2, "0");
-      const startAtSql = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+        // Determine if this is scheduled (future) or immediate booking
+        const isScheduled = startAt > now;
 
-      // Determine if this is scheduled (future) or immediate booking
-      const isScheduled = startAt > now;
-
-      if (isScheduled) {
-        // SCHEDULED BOOKING - slot stays available until start_at arrives
-        db.query(
-          `INSERT INTO bookings 
+        if (isScheduled) {
+          // SCHEDULED BOOKING - slot stays available until start_at arrives
+          db.query(
+            `INSERT INTO bookings 
            (user_id, parking_id, slot_id, reserved_at, start_at, expires_at, duration_minutes, total_price, status) 
            VALUES (?, ?, ?, NOW(), ?, DATE_ADD(?, INTERVAL ? MINUTE), ?, ?, 'active')`,
-          [
-            req.user.id,
-            parking_id,
-            slot.id,
-            startAtSql,
-            startAtSql,
-            duration_minutes,
-            duration_minutes,
-            total_price,
-          ],
-          (err3, result3) => {
-            if (err3) return res.status(500).json({ error: err3.message });
-
-            const expiresAt = new Date(
-              startAt.getTime() + duration_minutes * 60000,
-            );
-
-            res.status(201).json({
-              message:
-                "Parking slot reserved for a future time. It will be occupied when the reservation starts.",
-              booking_id: result3.insertId,
-              slot_number: slot.slot_number,
-              slot_id: slot.id,
-              total_price,
+            [
+              req.user.id,
+              parking_id,
+              slot.id,
+              startAtSql,
+              startAtSql,
               duration_minutes,
-              start_at: startAt.toISOString(),
-              expires_at: expiresAt.toISOString(),
-              slots_remaining: spot.available_slots,
-              is_scheduled: true,
-            });
-          },
-        );
-      } else {
-        // IMMEDIATE BOOKING - slot becomes unavailable right away
-        db.query(
-          `INSERT INTO bookings 
+              duration_minutes,
+              total_price,
+            ],
+            (err3, result3) => {
+              if (err3) return res.status(500).json({ error: err3.message });
+
+              const expiresAt = new Date(
+                startAt.getTime() + duration_minutes * 60000,
+              );
+
+              res.status(201).json({
+                message:
+                  "Parking slot reserved for a future time. It will be occupied when the reservation starts.",
+                booking_id: result3.insertId,
+                slot_number: slot.slot_number,
+                slot_id: slot.id,
+                total_price,
+                duration_minutes,
+                start_at: startAt.toISOString(),
+                expires_at: expiresAt.toISOString(),
+                slots_remaining: spot.available_slots,
+                is_scheduled: true,
+              });
+            },
+          );
+        } else {
+          // IMMEDIATE BOOKING - slot becomes unavailable right away
+          db.query(
+            `INSERT INTO bookings 
            (user_id, parking_id, slot_id, reserved_at, start_at, expires_at, duration_minutes, total_price, status) 
            VALUES (?, ?, ?, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL ? MINUTE), ?, ?, 'active')`,
-          [
-            req.user.id,
-            parking_id,
-            slot.id,
-            duration_minutes,
-            duration_minutes,
-            total_price,
-          ],
-          (err3, result3) => {
-            if (err3) return res.status(500).json({ error: err3.message });
+            [
+              req.user.id,
+              parking_id,
+              slot.id,
+              duration_minutes,
+              duration_minutes,
+              total_price,
+            ],
+            (err3, result3) => {
+              if (err3) return res.status(500).json({ error: err3.message });
 
-            // Mark slot as unavailable immediately
-            db.query(
-              "UPDATE parking_slots SET is_available = 0 WHERE id = ?",
-              [slot.id],
-              (err4) => {
-                if (err4) {
-                  console.error("Error updating slot availability:", err4);
-                }
+              // Mark slot as unavailable immediately
+              db.query(
+                "UPDATE parking_slots SET is_available = 0 WHERE id = ?",
+                [slot.id],
+                (err4) => {
+                  if (err4) {
+                    console.error("Error updating slot availability:", err4);
+                  }
 
-                // Update parking spot statistics
-                db.query(
-                  `UPDATE parking_spots 
+                  // Update parking spot statistics
+                  db.query(
+                    `UPDATE parking_spots 
                    SET available_slots = available_slots - 1,
                        occupied_slots = occupied_slots + 1
                    WHERE id = ?`,
-                  [parking_id],
-                  (err5) => {
-                    if (err5) {
-                      console.error("Error updating spot statistics:", err5);
-                    }
+                    [parking_id],
+                    (err5) => {
+                      if (err5) {
+                        console.error("Error updating spot statistics:", err5);
+                      }
 
-                    // Update availability table
-                    db.query(
-                      `UPDATE availability 
+                      // Update availability table
+                      db.query(
+                        `UPDATE availability 
                        SET occupied_slots = occupied_slots + 1,
                            available_slots = available_slots - 1,
                            updated_at = NOW()
                        WHERE parking_id = ?`,
-                      [parking_id],
-                      (err6) => {
-                        if (err6) {
-                          console.error(
-                            "Error updating availability table:",
-                            err6,
+                        [parking_id],
+                        (err6) => {
+                          if (err6) {
+                            console.error(
+                              "Error updating availability table:",
+                              err6,
+                            );
+                          }
+
+                          const expiresAt = new Date(
+                            Date.now() + duration_minutes * 60000,
                           );
-                        }
 
-                        const expiresAt = new Date(
-                          Date.now() + duration_minutes * 60000,
-                        );
-
-                        res.status(201).json({
-                          message: "Parking slot reserved successfully",
-                          booking_id: result3.insertId,
-                          slot_number: slot.slot_number,
-                          slot_id: slot.id,
-                          total_price,
-                          duration_minutes,
-                          start_at: new Date().toISOString(),
-                          expires_at: expiresAt.toISOString(),
-                          slots_remaining: spot.available_slots - 1,
-                          is_scheduled: false,
-                        });
-                      },
-                    );
-                  },
-                );
-              },
-            );
-          },
-        );
-      }
-    });
+                          res.status(201).json({
+                            message: "Parking slot reserved successfully",
+                            booking_id: result3.insertId,
+                            slot_number: slot.slot_number,
+                            slot_id: slot.id,
+                            total_price,
+                            duration_minutes,
+                            start_at: new Date().toISOString(),
+                            expires_at: expiresAt.toISOString(),
+                            slots_remaining: spot.available_slots - 1,
+                            is_scheduled: false,
+                          });
+                        },
+                      );
+                    },
+                  );
+                },
+              );
+            },
+          );
+        }
+      },
+    );
   });
 });
 
@@ -530,6 +553,60 @@ router.get("/spot/:parking_id/active-bookings", auth(["owner"]), (req, res) => {
       });
     },
   );
+});
+
+// Get booking schedule/calendar for a parking spot (PUBLIC - for users to see availability)
+router.get("/spot/:parking_id/schedule", (req, res) => {
+  const { parking_id } = req.params;
+  const { days = 7 } = req.query; // Default to next 7 days
+
+  const query = `
+    SELECT 
+      DATE(b.start_at) as booking_date,
+      HOUR(b.start_at) as booking_hour,
+      COUNT(DISTINCT b.slot_id) as slots_booked,
+      ps.total_slots,
+      ps.active_slots,
+      GROUP_CONCAT(
+        CONCAT(
+          TIME_FORMAT(b.start_at, '%H:%i'), 
+          '-', 
+          TIME_FORMAT(b.expires_at, '%H:%i'),
+          ' (Slot ', sl.slot_number, ')'
+        ) 
+        ORDER BY b.start_at 
+        SEPARATOR '; '
+      ) as booking_details
+    FROM bookings b
+    JOIN parking_slots sl ON b.slot_id = sl.id
+    JOIN parking_spots ps ON b.parking_id = ps.id
+    WHERE b.parking_id = ?
+      AND b.status = 'active'
+      AND DATE(b.start_at) BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL ? DAY)
+    GROUP BY DATE(b.start_at), HOUR(b.start_at), ps.total_slots, ps.active_slots
+    ORDER BY booking_date ASC, booking_hour ASC
+  `;
+
+  db.query(query, [parking_id, days], (err, result) => {
+    if (err) return res.status(500).json({ error: err.message });
+
+    // Get spot info
+    db.query(
+      "SELECT id, name, total_slots, active_slots, available_slots, price FROM parking_spots WHERE id = ?",
+      [parking_id],
+      (err2, spotInfo) => {
+        if (err2) return res.status(500).json({ error: err2.message });
+        if (!spotInfo.length) {
+          return res.status(404).json({ message: "Parking spot not found" });
+        }
+
+        res.json({
+          spot: spotInfo[0],
+          schedule: result,
+        });
+      },
+    );
+  });
 });
 
 module.exports = router;

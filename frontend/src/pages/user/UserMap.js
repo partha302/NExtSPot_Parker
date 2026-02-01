@@ -9,6 +9,7 @@ import {
 } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import BookingSchedule from "../../components/BookingSchedule";
 
 // Component to handle routing
 function RoutingController({
@@ -201,31 +202,34 @@ function MapResizeHandler({ showSpotsList }) {
   useEffect(() => {
     if (!map || !map.invalidateSize) return;
 
-    try {
-      map.invalidateSize();
-    } catch (err) {
-      // ignore
-    }
-
-    const start = Date.now();
-    const duration = 420;
-    const interval = 80;
-
-    const handle = setInterval(() => {
+    // Immediate resize
+    const resize = () => {
       try {
-        map.invalidateSize();
+        map.invalidateSize({ animate: true });
       } catch (err) {
         // ignore
       }
-      if (Date.now() - start > duration) {
-        clearInterval(handle);
-        try {
-          map.invalidateSize();
-        } catch (err) {}
-      }
-    }, interval);
+    };
 
-    return () => clearInterval(handle);
+    resize();
+
+    // Use requestAnimationFrame for smoother animation
+    let frameCount = 0;
+    const maxFrames = 30; // ~500ms at 60fps
+
+    const animate = () => {
+      if (frameCount < maxFrames) {
+        resize();
+        frameCount++;
+        requestAnimationFrame(animate);
+      }
+    };
+
+    const animationFrame = requestAnimationFrame(animate);
+
+    return () => {
+      cancelAnimationFrame(animationFrame);
+    };
   }, [showSpotsList, map]);
 
   return null;
@@ -287,6 +291,40 @@ function MapController({
   return null;
 }
 
+// Component to handle map view centering when spot is selected
+function MapViewController({ center, zoom, onAnimationComplete }) {
+  const map = useMap();
+  const lastCenterRef = useRef(null);
+
+  useEffect(() => {
+    if (!map || !center) return;
+
+    // Only animate if the center has actually changed
+    const centerKey = `${center[0]}-${center[1]}`;
+    if (lastCenterRef.current === centerKey) return;
+
+    lastCenterRef.current = centerKey;
+
+    try {
+      map.flyTo(center, zoom || 16, {
+        duration: 1.5,
+        easeLinearity: 0.5,
+      });
+
+      // Clear the center after animation to prevent re-triggering
+      setTimeout(() => {
+        if (onAnimationComplete) {
+          onAnimationComplete();
+        }
+      }, 1600); // Slightly longer than animation duration
+    } catch (err) {
+      console.warn("Error setting map view:", err);
+    }
+  }, [center, zoom, map, onAnimationComplete]);
+
+  return null;
+}
+
 function UserMap() {
   const [spots, setSpots] = useState([]);
   const [message, setMessage] = useState("");
@@ -326,8 +364,15 @@ function UserMap() {
   const [reviewsPagination, setReviewsPagination] = useState(null);
   const [selectedSpotForReviews, setSelectedSpotForReviews] = useState(null);
   const [expandedSpotId, setExpandedSpotId] = useState(null);
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [scheduleSpotId, setScheduleSpotId] = useState(null);
+  const [mapCenter, setMapCenter] = useState(null);
+  const [mapZoom, setMapZoom] = useState(15);
   const refreshIntervalRef = useRef(null);
   const isRefreshingRef = useRef(false);
+  const markerRefs = useRef({});
+  const spotCardRefs = useRef({});
+  const lastCenteredSpotId = useRef(null);
 
   // Helper function to safely format numbers
   const safeToFixed = (value, decimals = 2) => {
@@ -417,6 +462,10 @@ function UserMap() {
 
         setMessage("");
         setLocationError("");
+
+        // Pan map to user location
+        setMapCenter(newLocation);
+        setMapZoom(15);
       },
       (error) => {
         let errorMessage = "";
@@ -617,6 +666,7 @@ function UserMap() {
     setSelectedSpot(null);
     setMessage("");
     setShouldClosePopups(true);
+    lastCenteredSpotId.current = null;
 
     if (!refreshIntervalRef.current) {
       refreshIntervalRef.current = setInterval(() => fetchSpots(false), 2000);
@@ -770,11 +820,69 @@ function UserMap() {
   };
 
   const selectSpot = (spot) => {
-    setSelectedSpot(spot);
+    if (selectedSpot && selectedSpot.id === spot.id) {
+      // Deselect if clicking the same spot
+      setSelectedSpot(null);
+      setMapCenter(null);
+      setMapZoom(15);
+      lastCenteredSpotId.current = null;
+      if (markerRefs.current[spot.id]) {
+        markerRefs.current[spot.id].closePopup();
+      }
+    } else {
+      // Close all other popups
+      Object.keys(markerRefs.current).forEach((id) => {
+        if (markerRefs.current[id] && parseInt(id) !== spot.id) {
+          markerRefs.current[id].closePopup();
+        }
+      });
+
+      setSelectedSpot(spot);
+
+      // Only center map if this is a different spot than the last centered one
+      if (lastCenteredSpotId.current !== spot.id) {
+        setMapCenter([spot.latitude, spot.longitude]);
+        setMapZoom(17);
+        lastCenteredSpotId.current = spot.id;
+      }
+
+      // Scroll the selected spot card into view and open popup
+      setTimeout(() => {
+        if (spotCardRefs.current[spot.id]) {
+          spotCardRefs.current[spot.id].scrollIntoView({
+            behavior: "smooth",
+            block: "nearest",
+            inline: "nearest",
+          });
+        }
+
+        if (markerRefs.current[spot.id]) {
+          markerRefs.current[spot.id].openPopup();
+        }
+      }, 100);
+    }
   };
 
   const toggleSpotExpanded = (spotId) => {
-    setExpandedSpotId(expandedSpotId === spotId ? null : spotId);
+    const newExpandedState = expandedSpotId === spotId ? null : spotId;
+    setExpandedSpotId(newExpandedState);
+
+    // Close popup when expanding details
+    if (newExpandedState === spotId && markerRefs.current[spotId]) {
+      markerRefs.current[spotId].closePopup();
+    }
+
+    // Reopen popup when collapsing details
+    if (
+      newExpandedState === null &&
+      selectedSpot &&
+      selectedSpot.id === spotId &&
+      markerRefs.current[spotId]
+    ) {
+      setTimeout(() => {
+        markerRefs.current[spotId].openPopup();
+      }, 100);
+    }
   };
 
   const filterAndSortSpots = (spotsToFilter) => {
@@ -901,7 +1009,16 @@ function UserMap() {
         color = "#6b7280";
     }
 
-    const size = isSelected ? 32 : 28;
+    const size = isSelected ? 34 : 28;
+    const pulseAnimation = isSelected
+      ? `
+      @keyframes pulse {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.08); }
+      }
+      animation: pulse 2s ease-in-out infinite;
+    `
+      : "";
 
     return L.divIcon({
       html: `<div style="
@@ -910,16 +1027,17 @@ function UserMap() {
         border-radius: 50%;
         background: ${color};
         border: 3px solid white;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        box-shadow: ${isSelected ? "0 0 0 4px rgba(139, 92, 246, 0.3)," : ""} 0 ${isSelected ? "6" : "4"}px ${isSelected ? "16" : "12"}px rgba(0, 0, 0, ${isSelected ? "0.25" : "0.15"});
         display: flex;
         align-items: center;
         justify-content: center;
         font-weight: 700;
         color: white;
-        font-size: 14px;
+        font-size: ${isSelected ? "16" : "14"}px;
         cursor: pointer;
-        transition: all 0.3s ease;
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
         font-family: 'Inter', sans-serif;
+        ${pulseAnimation}
       ">
         P
       </div>`,
@@ -1252,23 +1370,22 @@ function UserMap() {
                 const statusInfo = getSpotStatusInfo(spot.status);
                 const spotReview = reviewSummaries[spot.id];
                 const isExpanded = expandedSpotId === spot.id;
+                const isSelected = selectedSpot?.id === spot.id;
 
                 return (
                   <div
                     key={spot.id}
-                    className={`bg-white rounded-xl border transition-all shadow-[0_2px_10px_-1px_rgba(0,0,0,0.03)] ${
-                      selectedSpot?.id === spot.id
-                        ? "border-[#4F86C6] shadow-[0_4px_20px_-2px_rgba(79,134,198,0.2)]"
+                    ref={(el) => (spotCardRefs.current[spot.id] = el)}
+                    className={`bg-white rounded-xl border transition-all duration-300 shadow-[0_2px_10px_-1px_rgba(0,0,0,0.03)] ${
+                      isSelected
+                        ? "border-[#4F86C6] shadow-[0_4px_20px_-2px_rgba(79,134,198,0.2)] scale-[1.01]"
                         : "border-[#E2E8F0] hover:border-[#4F86C6]/30 hover:shadow-[0_4px_20px_-2px_rgba(0,0,0,0.05)]"
                     }`}
                   >
                     {/* Collapsed View - Always Visible */}
                     <div
-                      onClick={() => {
-                        selectSpot(spot);
-                        toggleSpotExpanded(spot.id);
-                      }}
-                      className="p-4 cursor-pointer"
+                      onClick={() => selectSpot(spot)}
+                      className="p-4 cursor-pointer transition-colors hover:bg-slate-50/50"
                     >
                       <div className="flex items-start justify-between">
                         <div className="flex-1">
@@ -1356,35 +1473,6 @@ function UserMap() {
                       }`}
                     >
                       <div className="px-4 pb-4 border-t border-slate-100 pt-4">
-                        {/* Spot Image Placeholder */}
-                        <div className="relative h-36 w-full bg-gradient-to-br from-slate-100 to-slate-200 rounded-lg mb-4 overflow-hidden">
-                          <div className="absolute inset-0 flex items-center justify-center">
-                            <span className="material-symbols-outlined text-6xl text-slate-300">
-                              local_parking
-                            </span>
-                          </div>
-
-                          {/* Rating Badge */}
-                          {spotReview && spotReview.average_rating > 0 && (
-                            <div className="absolute top-2 right-2 bg-white/90 backdrop-blur-sm px-2 py-1 rounded-md flex items-center gap-1 shadow-sm">
-                              <span className="material-symbols-outlined text-amber-400 text-sm">
-                                star
-                              </span>
-                              <span className="text-xs font-bold text-[#334155]">
-                                {spotReview.average_rating.toFixed(1)}
-                              </span>
-                              <span className="text-[10px] text-[#64748B]">
-                                ({spotReview.total_reviews})
-                              </span>
-                            </div>
-                          )}
-
-                          {/* Price Badge */}
-                          <div className="absolute bottom-2 left-2 bg-white text-[#334155] text-xs font-bold px-3 py-1.5 rounded-lg shadow-lg border border-[#E2E8F0]">
-                            ₹{spot.price} / hr
-                          </div>
-                        </div>
-
                         {/* Address */}
                         <p className="text-sm text-[#64748B] mb-4">
                           {spot.address ||
@@ -1403,7 +1491,7 @@ function UserMap() {
                                   spot.name,
                                 );
                               }}
-                              className="flex-1 py-2.5 bg-white border border-[#E2E8F0] hover:bg-slate-50 text-[#334155] text-sm font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+                              className="flex-1 py-2.5 bg-white border border-[#E2E8F0] hover:bg-slate-50 hover:border-[#4F86C6] text-[#334155] text-sm font-semibold rounded-lg transition-all duration-200 flex items-center justify-center gap-2 hover:shadow-md"
                             >
                               <span className="material-symbols-outlined text-[18px]">
                                 directions
@@ -1415,7 +1503,7 @@ function UserMap() {
                                 e.stopPropagation();
                                 openBookingDialog(spot.id);
                               }}
-                              className="flex-1 py-2.5 bg-[#4F86C6] hover:bg-[#3B6FA6] text-white text-sm font-semibold rounded-lg transition-colors shadow-sm shadow-[#4F86C6]/30"
+                              className="flex-1 py-2.5 bg-[#4F86C6] hover:bg-[#3B6FA6] text-white text-sm font-semibold rounded-lg transition-all duration-200 shadow-sm shadow-[#4F86C6]/30 hover:shadow-lg hover:shadow-[#4F86C6]/40 hover:-translate-y-0.5"
                             >
                               Book Now
                             </button>
@@ -1428,17 +1516,32 @@ function UserMap() {
                             e.stopPropagation();
                             openReviewsModal(spot);
                           }}
-                          className="w-full py-2 bg-amber-50 border border-amber-200 hover:bg-amber-100 text-amber-800 text-xs font-semibold rounded-lg transition-colors flex items-center justify-center gap-2"
+                          className="w-full py-2 bg-amber-50 border border-amber-200 hover:bg-amber-100 text-amber-800 text-xs font-semibold rounded-lg transition-all duration-200 flex items-center justify-center gap-2 hover:shadow-md"
                         >
                           <span className="material-symbols-outlined text-[16px]">
                             star
                           </span>
                           View Reviews
                           {canReviewSpots[spot.id]?.canReview && (
-                            <span className="bg-green-600 text-white px-2 py-0.5 rounded text-[10px] font-bold">
+                            <span className="bg-purple-600 text-white px-2 py-0.5 rounded text-[10px] font-bold">
                               Can Review
                             </span>
                           )}
+                        </button>
+
+                        {/* Booking Schedule Button */}
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setScheduleSpotId(spot.id);
+                            setShowScheduleModal(true);
+                          }}
+                          className="w-full py-2 bg-blue-50 border border-blue-200 hover:bg-blue-100 text-blue-800 text-xs font-semibold rounded-lg transition-all duration-200 flex items-center justify-center gap-2 hover:shadow-md mt-2"
+                        >
+                          <span className="material-symbols-outlined text-[16px]">
+                            calendar_month
+                          </span>
+                          View Booking Schedule
                         </button>
                       </div>
                     </div>
@@ -1548,6 +1651,11 @@ function UserMap() {
                   onRouteClear={handleRouteClear}
                 />
                 <MapResizeHandler showSpotsList={showSpotsList} />
+                <MapViewController
+                  center={mapCenter}
+                  zoom={mapZoom}
+                  onAnimationComplete={() => setMapCenter(null)}
+                />
 
                 {userLocation && (
                   <Marker position={userLocation} icon={createUserIcon()}>
@@ -1574,14 +1682,20 @@ function UserMap() {
                   )
                   .map((spot) => (
                     <Marker
-                      key={`${spot.id}-${spot.status}`}
+                      key={`${spot.id}-${spot.status}-${selectedSpot?.id === spot.id ? "selected" : "unselected"}`}
                       position={[
                         parseFloat(spot.latitude),
                         parseFloat(spot.longitude),
                       ]}
                       icon={createSpotIcon(spot, selectedSpot?.id === spot.id)}
+                      ref={(ref) => {
+                        markerRefs.current[spot.id] = ref;
+                      }}
                       eventHandlers={{
-                        click: () => selectSpot(spot),
+                        click: (e) => {
+                          e.originalEvent?.stopPropagation?.();
+                          selectSpot(spot);
+                        },
                       }}
                     >
                       <Popup>
@@ -1628,7 +1742,7 @@ function UserMap() {
                           </div>
 
                           {spot.status === "available" && (
-                            <div className="flex gap-2">
+                            <div className="flex gap-2 mb-2">
                               <button
                                 onClick={() =>
                                   showRoute(
@@ -1649,6 +1763,36 @@ function UserMap() {
                               </button>
                             </div>
                           )}
+
+                          {/* Reviews Button */}
+                          <button
+                            onClick={() => openReviewsModal(spot)}
+                            className="w-full py-2 bg-amber-50 border border-amber-200 hover:bg-amber-100 text-amber-800 text-xs font-semibold rounded-lg transition-all duration-200 flex items-center justify-center gap-2 hover:shadow-md mb-2"
+                          >
+                            <span className="material-symbols-outlined text-[16px]">
+                              star
+                            </span>
+                            View Reviews
+                            {canReviewSpots[spot.id]?.canReview && (
+                              <span className="bg-purple-600 text-white px-2 py-0.5 rounded text-[10px] font-bold">
+                                Can Review
+                              </span>
+                            )}
+                          </button>
+
+                          {/* Booking Schedule Button */}
+                          <button
+                            onClick={() => {
+                              setScheduleSpotId(spot.id);
+                              setShowScheduleModal(true);
+                            }}
+                            className="w-full py-2 bg-blue-50 border border-blue-200 hover:bg-blue-100 text-blue-800 text-xs font-semibold rounded-lg transition-all duration-200 flex items-center justify-center gap-2 hover:shadow-md"
+                          >
+                            <span className="material-symbols-outlined text-[16px]">
+                              calendar_month
+                            </span>
+                            View Booking Schedule
+                          </button>
                         </div>
                       </Popup>
                     </Marker>
@@ -2223,6 +2367,17 @@ function UserMap() {
           transform: translateX(0);
         }
       `}</style>
+
+      {/* Booking Schedule Modal */}
+      {showScheduleModal && scheduleSpotId && (
+        <BookingSchedule
+          parkingSpotId={scheduleSpotId}
+          onClose={() => {
+            setShowScheduleModal(false);
+            setScheduleSpotId(null);
+          }}
+        />
+      )}
     </>
   );
 }
