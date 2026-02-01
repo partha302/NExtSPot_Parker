@@ -419,71 +419,268 @@ def detect_vehicle_ensemble(slot_region_bgr: np.ndarray,
                            use_ai: bool = True) -> Tuple[bool, float, bool]:
     """
     Ensemble detection combining multiple methods for best accuracy.
-    ENHANCED: Now detects and rejects hands/rapid motion.
+    IMPROVED: Better shadow vs object discrimination.
     Returns: (is_occupied, confidence, is_shadow)
     """
     
     # First check for rapid motion (hand passing through)
     is_rapid_motion, motion_level = detect_rapid_motion(slot_region_bgr, previous_region_bgr)
     if is_rapid_motion:
-        # High motion = transient object, not a parked item
         return False, 0.8, False
     
-    # Check for skin tones (hand detection)
-    has_skin, skin_ratio = detect_skin_tone(slot_region_bgr)
-    if has_skin and skin_ratio > 0.25:
-        # Large skin area = likely a hand
-        return False, 0.75, False
+    # Check if this is likely a shadow (dark area with no internal structure)
+    is_shadow_region, shadow_confidence = is_likely_shadow(slot_region_bgr, reference_region_bgr)
     
-    # Check for shadows
-    is_shadow, shadow_conf = detect_shadow(slot_region_bgr, reference_region_bgr)
-    
-    if is_shadow and shadow_conf > 0.7:
-        return False, 0.85, True
+    if is_shadow_region and shadow_confidence > 0.75:
+        return False, shadow_confidence, True
     
     votes = []
     confidences = []
     weights = []
     
-    # Penalize if some skin detected (might be partial hand)
-    if has_skin:
-        votes.append(False)
-        confidences.append(0.6)
-        weights.append(1.5)
-    
-    if is_shadow:
-        votes.append(False)
-        confidences.append(shadow_conf)
-        weights.append(2.0)
-    
+    # Method 1: Color-based detection
     is_occ_color, conf_color = detect_vehicle_color_based(slot_region_bgr)
     votes.append(is_occ_color)
     confidences.append(conf_color)
-    weights.append(1.0)
+    weights.append(1.5)
     
+    # Method 2: Texture-based detection
     is_occ_texture, conf_texture = detect_vehicle_texture_based(slot_region_bgr)
     votes.append(is_occ_texture)
     confidences.append(conf_texture)
-    weights.append(1.0)
+    weights.append(1.5)
     
-    if reference_region_bgr is not None:
-        is_occ_diff, conf_diff = detect_vehicle_difference_based(slot_region_bgr, reference_region_bgr)
-        votes.append(is_occ_diff)
-        confidences.append(conf_diff)
-        weights.append(2.5)
+    # Method 3: Simple object detection (edges, gradients, structure)
+    is_occ_simple, conf_simple = detect_object_simple(slot_region_bgr)
+    votes.append(is_occ_simple)
+    confidences.append(conf_simple)
+    weights.append(2.0)
+    
+    # Method 4: Internal structure check (real objects have internal edges)
+    has_structure, structure_conf = has_internal_structure(slot_region_bgr)
+    votes.append(has_structure)
+    confidences.append(structure_conf)
+    weights.append(2.5)  # High weight - this is key for shadow rejection
+    
+    # If it looks like a shadow, add negative vote
+    if is_shadow_region:
+        votes.append(False)
+        confidences.append(shadow_confidence)
+        weights.append(2.0)
     
     weighted_occupied_votes = sum(w for v, w in zip(votes, weights) if v)
     weighted_vacant_votes = sum(w for v, w in zip(votes, weights) if not v)
     total_weight = sum(weights)
     
-    is_occupied = weighted_occupied_votes > weighted_vacant_votes * 1.1
+    is_occupied = weighted_occupied_votes > weighted_vacant_votes
     
     weighted_conf = sum(c * w for c, w in zip(confidences, weights)) / total_weight
-    
     vote_agreement = max(weighted_occupied_votes, weighted_vacant_votes) / total_weight
     final_confidence = float(weighted_conf * vote_agreement)
     
-    return is_occupied, final_confidence, is_shadow
+    return is_occupied, final_confidence, is_shadow_region
+
+
+def is_likely_shadow(slot_region_bgr: np.ndarray, 
+                     reference_region_bgr: Optional[np.ndarray] = None) -> Tuple[bool, float]:
+    """
+    Determine if a region is likely a shadow rather than an object.
+    
+    Shadows have these characteristics:
+    - Darker than reference but same hue
+    - Low internal edge density (uniform darkness)
+    - Low color saturation variation
+    - No distinct internal structure
+    """
+    try:
+        gray = cv2.cvtColor(slot_region_bgr, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(slot_region_bgr, cv2.COLOR_BGR2HSV)
+        
+        # Check 1: Internal edge density (shadows have few internal edges)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        low_edges = edge_density < 0.02  # Shadows have very few internal edges
+        
+        # Check 2: Color uniformity (shadows are uniformly dark)
+        val_std = float(np.std(hsv[:, :, 2]))
+        sat_std = float(np.std(hsv[:, :, 1]))
+        uniform_color = val_std < 30 and sat_std < 25
+        
+        # Check 3: Low saturation overall (shadows desaturate colors)
+        mean_sat = float(np.mean(hsv[:, :, 1]))
+        low_saturation = mean_sat < 50
+        
+        # Check 4: If we have reference, check if only brightness changed
+        hue_preserved = False
+        if reference_region_bgr is not None:
+            try:
+                if slot_region_bgr.shape != reference_region_bgr.shape:
+                    reference_region_bgr = cv2.resize(reference_region_bgr, 
+                                                     (slot_region_bgr.shape[1], slot_region_bgr.shape[0]))
+                
+                hsv_ref = cv2.cvtColor(reference_region_bgr, cv2.COLOR_BGR2HSV)
+                
+                # Hue difference (shadows preserve hue)
+                hue_diff = cv2.absdiff(hsv[:, :, 0], hsv_ref[:, :, 0])
+                hue_diff = np.minimum(hue_diff, 180 - hue_diff)
+                mean_hue_diff = float(np.mean(hue_diff))
+                
+                # Value difference (shadows are darker)
+                val_diff = float(np.mean(hsv_ref[:, :, 2])) - float(np.mean(hsv[:, :, 2]))
+                
+                # Shadow: hue similar, but darker
+                hue_preserved = mean_hue_diff < 15 and val_diff > 20
+            except:
+                pass
+        
+        # Calculate shadow score
+        shadow_indicators = sum([low_edges, uniform_color, low_saturation, hue_preserved])
+        
+        # Need multiple indicators to call it a shadow
+        is_shadow = shadow_indicators >= 3
+        confidence = min(0.95, 0.5 + shadow_indicators * 0.15)
+        
+        return is_shadow, confidence
+        
+    except Exception as e:
+        return False, 0.5
+
+
+def has_internal_structure(slot_region_bgr: np.ndarray) -> Tuple[bool, float]:
+    """
+    Check if the region has internal structure (edges, texture, patterns).
+    Real objects have internal detail, shadows don't.
+    
+    This helps detect:
+    - White objects (they still have edges/structure)
+    - Colored objects (they have texture)
+    
+    And reject:
+    - Shadows (uniform darkness, no internal edges)
+    """
+    try:
+        gray = cv2.cvtColor(slot_region_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Edge detection at multiple scales
+        edges_fine = cv2.Canny(gray, 30, 100)
+        edges_coarse = cv2.Canny(gray, 50, 150)
+        
+        edge_density_fine = np.sum(edges_fine > 0) / edges_fine.size
+        edge_density_coarse = np.sum(edges_coarse > 0) / edges_coarse.size
+        
+        # Gradient magnitude (texture indicator)
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+        mean_gradient = float(np.mean(gradient_mag))
+        max_gradient = float(np.max(gradient_mag))
+        
+        # Local contrast (variance in small windows)
+        kernel_size = max(5, min(gray.shape) // 10)
+        local_mean = cv2.blur(gray.astype(np.float32), (kernel_size, kernel_size))
+        local_var = cv2.blur((gray.astype(np.float32) - local_mean)**2, (kernel_size, kernel_size))
+        mean_local_var = float(np.mean(np.sqrt(local_var)))
+        
+        # Scoring
+        score = 0
+        
+        # Fine edges (detail)
+        if edge_density_fine > 0.03:
+            score += 1
+        if edge_density_fine > 0.06:
+            score += 1
+            
+        # Coarse edges (object boundaries)
+        if edge_density_coarse > 0.02:
+            score += 1
+            
+        # Gradient (texture)
+        if mean_gradient > 12:
+            score += 1
+        if mean_gradient > 25:
+            score += 1
+            
+        # Strong edges somewhere (object boundary)
+        if max_gradient > 100:
+            score += 1
+            
+        # Local contrast (internal detail)
+        if mean_local_var > 10:
+            score += 1
+        if mean_local_var > 20:
+            score += 1
+        
+        has_structure = score >= 3
+        confidence = min(0.95, 0.4 + score * 0.08)
+        
+        return has_structure, confidence
+        
+    except Exception as e:
+        return False, 0.5
+
+
+def detect_object_simple(slot_region_bgr: np.ndarray) -> Tuple[bool, float]:
+    """
+    Simple object detection based on visual complexity.
+    Detects if there's any significant object in the region.
+    """
+    try:
+        gray = cv2.cvtColor(slot_region_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Edge detection
+        edges = cv2.Canny(gray, 50, 150)
+        edge_density = np.sum(edges > 0) / edges.size
+        
+        # Color variance
+        hsv = cv2.cvtColor(slot_region_bgr, cv2.COLOR_BGR2HSV)
+        hue_std = float(np.std(hsv[:, :, 0]))
+        sat_std = float(np.std(hsv[:, :, 1]))
+        val_std = float(np.std(hsv[:, :, 2]))
+        
+        # Gradient magnitude
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+        mean_gradient = float(np.mean(gradient_mag))
+        
+        # Score based on multiple factors
+        score = 0
+        
+        # Edge density check (objects have edges)
+        if edge_density > 0.03:
+            score += 1
+        if edge_density > 0.06:
+            score += 1
+            
+        # Hue variation (colored objects)
+        if hue_std > 15:
+            score += 1
+        if hue_std > 30:
+            score += 1
+            
+        # Saturation variation
+        if sat_std > 30:
+            score += 1
+            
+        # Value variation (contrast)
+        if val_std > 25:
+            score += 1
+            
+        # Gradient (sharp features)
+        if mean_gradient > 15:
+            score += 1
+        if mean_gradient > 30:
+            score += 1
+        
+        # Need at least 3 indicators to consider occupied
+        is_occupied = score >= 3
+        confidence = min(0.95, 0.5 + score * 0.08)
+        
+        return is_occupied, confidence
+        
+    except Exception as e:
+        print(f"⚠️ Simple detection error: {e}")
+        return False, 0.5
 
 
 def clamp_bbox(bbox, width, height):
@@ -519,9 +716,9 @@ class SlotTracker:
     """
     
     # Configuration constants for temporal persistence
-    STABILITY_TIME_SECONDS = 5.0      # Object must be stable for this long to confirm occupied
-    VACANCY_TIME_SECONDS = 1.0        # Must be empty for this long to confirm vacant
-    MIN_CONSECUTIVE_FRAMES = 8        # Minimum consecutive same-state detections
+    STABILITY_TIME_SECONDS = 1.5      # Object must be stable for this long to confirm occupied (reduced from 5.0)
+    VACANCY_TIME_SECONDS = 0.5        # Must be empty for this long to confirm vacant (reduced from 1.0)
+    MIN_CONSECUTIVE_FRAMES = 4        # Minimum consecutive same-state detections (reduced from 8)
     MOTION_THRESHOLD = 25.0           # Pixel difference threshold for motion detection
     HISTORY_SIZE = 15                 # Larger history for better temporal smoothing
     
@@ -747,12 +944,34 @@ class DetectionSession:
         
         # Initialize slot trackers from config
         if grid_config and "cells" in grid_config:
-            has_normalized = grid_config["cells"][0].get("bbox_normalized") is not None
+            cells = grid_config["cells"]
             
-            if has_normalized:
-                print(f"📊 Session created with normalized grid (will scale on first frame)")
+            # Check if we have frame dimensions to scale normalized coords immediately
+            if cells and cells[0].get("bbox_normalized"):
+                # If grid_config has frame dimensions, scale immediately
+                if "frame_width" in grid_config and "frame_height" in grid_config:
+                    width = grid_config["frame_width"]
+                    height = grid_config["frame_height"]
+                    print(f"📐 Scaling normalized coordinates to configured size: {width}x{height}")
+                    
+                    for cell in cells:
+                        slot_num = cell["slot_number"]
+                        norm_bbox = cell["bbox_normalized"]
+                        
+                        x1 = int(norm_bbox[0] * width)
+                        y1 = int(norm_bbox[1] * height)
+                        x2 = int(norm_bbox[2] * width)
+                        y2 = int(norm_bbox[3] * height)
+                        
+                        bbox = [x1, y1, x2, y2]
+                        self.slots[slot_num] = SlotTracker(slot_num, bbox)
+                    
+                    print(f"📊 Session created with {len(self.slots)} pre-scaled slots")
+                else:
+                    print(f"📊 Session created with normalized grid (will scale on first frame)")
             else:
-                for cell in grid_config["cells"]:
+                # Has absolute coordinates
+                for cell in cells:
                     slot_num = cell["slot_number"]
                     bbox = cell["bbox"]
                     self.slots[slot_num] = SlotTracker(slot_num, bbox)

@@ -7,15 +7,15 @@ import Login from "./pages/Login";
 import OwnerLogin from "./pages/OwnerLogin";
 import Register from "./pages/Register";
 
-
 // New parking management pages
 import UserMap from "./pages/user/UserMap";
 import UserReservations from "./pages/user/UserReservations";
 import UserReviews from "./pages/user/UserReviews";
 import OwnerDashboard from "./pages/owner/OwnerDashboard";
 import OwnerBookings from "./pages/owner/OwnerBookings";
-import OwnerReviewsPage from './pages/owner/OwnerReviewsPage';
-import SlotManagement from './components/SlotManagement';
+import OwnerReviewsPage from "./pages/owner/OwnerReviewsPage";
+import SlotManagement from "./components/SlotManagement";
+import AICameraSetup from "./components/AICameraSetup";
 
 function App() {
   return (
@@ -37,6 +37,7 @@ function App() {
       <Route path="/owner/bookings" element={<OwnerBookings />} />
       <Route path="/owner/reviews" element={<OwnerReviewsPage />} />
       <Route path="/owner/slots/:spotId" element={<SlotManagement />} />
+      <Route path="/owner/ai-setup/:spotId" element={<AICameraSetup />} />
 
       {/* Redirect unknown routes to home */}
       <Route path="*" element={<Navigate to="/" replace />} />

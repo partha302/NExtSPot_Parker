@@ -5,6 +5,7 @@ const http = require("http");
 const { Server } = require("socket.io");
 const axios = require("axios");
 const mysql = require("mysql2");
+const jwt = require("jsonwebtoken");
 
 // --- Basic setup ---
 const app = express();
@@ -53,8 +54,30 @@ const activeSessions = require("./activeSessions");
 const server = http.createServer(app);
 
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: {
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
   maxHttpBufferSize: 10e6, // 10 MB - adjust if needed
+  transports: ["websocket", "polling"],
+});
+
+// --- Socket.IO Authentication Middleware ---
+io.use((socket, next) => {
+  const token = socket.handshake.auth.token;
+
+  if (!token) {
+    return next(new Error("Authentication error: No token provided"));
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    socket.user = decoded;
+    next();
+  } catch (err) {
+    next(new Error("Authentication error: Invalid token"));
+  }
 });
 
 // --- Helper: update DB after detection ---
@@ -95,157 +118,53 @@ function updateSlotInDatabase(spot_id, slot_id, status, confidence) {
          VALUES (?, ?, ?, ?, NOW())`,
         [spot_id, slot_id, status, confidence],
         (err3) => {
-          if (err3) console.error("⚠️ Log error:", err3);
+          if (err3) console.warn("⚠️ Log error:", err3);
         },
       );
     },
   );
 }
 
-// --- Socket.IO logic ---
-function setupSocketIO(ioInstance, activeSessionsMap) {
-  const PYTHON_AI_SERVER =
-    process.env.PYTHON_AI_SERVER || "http://localhost:5001";
+// --- Socket.IO Connection Handling ---
+io.on("connection", (socket) => {
+  console.log(`🔌 Client connected: ${socket.id} (User: ${socket.user.id})`);
 
-  ioInstance.on("connection", (socket) => {
-    console.log(`🔌 Client connected: ${socket.id}`);
-
-    // Receive video frame from frontend
-    socket.on("video_frame", async (data) => {
-      try {
-        const { spot_id, frame, timestamp, use_ai } = data;
-
-        if (!spot_id) {
-          socket.emit("error", { message: "Missing spot_id" });
-          return;
-        }
-
-        if (!activeSessionsMap.has(spot_id)) {
-          socket.emit("error", { message: "No active detection session" });
-          return;
-        }
-
-        // Accept either raw base64 string or binary buffer or Uint8Array
-        let base64Frame;
-        if (typeof frame === "string") {
-          if (frame.startsWith("data:")) {
-            base64Frame = frame.split(",")[1];
-          } else {
-            base64Frame = frame;
-          }
-        } else if (Buffer.isBuffer(frame)) {
-          base64Frame = frame.toString("base64");
-        } else if (frame && frame.data && Array.isArray(frame.data)) {
-          base64Frame = Buffer.from(frame.data).toString("base64");
-        } else {
-          socket.emit("error", { message: "Unsupported frame format" });
-          return;
-        }
-
-        // Forward frame to Python AI server with use_ai flag
-        const response = await axios.post(
-          `${PYTHON_AI_SERVER}/process-frame`,
-          {
-            spot_id,
-            frame: base64Frame,
-            timestamp,
-            use_ai: use_ai !== false, // Default to true if not specified
-          },
-          {
-            headers: { "Content-Type": "application/json" },
-            timeout: 10000,
-          },
-        );
-
-        const {
-          processed_frame,
-          occupancy,
-          state_change,
-          frame_count,
-          num_slots,
-        } = response.data || {};
-
-        // Always emit processed frame if available (for live visualization)
-        if (processed_frame) {
-          socket.emit("ai_processed_frame", {
-            spot_id,
-            processed_frame,
-            frame_count,
-            num_slots,
-          });
-        }
-
-        // Handle state changes
-        if (state_change) {
-          const session = activeSessionsMap.get(spot_id);
-          const changedSlot = state_change.slot_number;
-          const oldStatus = state_change.old_status;
-          const newStatus = state_change.new_status;
-
-          const mappedSlotId =
-            session && session.slot_mapping
-              ? session.slot_mapping[String(changedSlot)]
-              : null;
-
-          if (mappedSlotId == null) {
-            console.warn(
-              `⚠️ No slot mapping for changedSlot ${changedSlot} on spot ${spot_id}`,
-            );
-          } else {
-            const confidence =
-              (occupancy &&
-                occupancy.slots &&
-                occupancy.slots[String(changedSlot)] &&
-                occupancy.slots[String(changedSlot)].confidence) ||
-              0;
-
-            updateSlotInDatabase(spot_id, mappedSlotId, newStatus, confidence);
-          }
-
-          socket.emit("occupancy_update", {
-            spot_id,
-            changed_slot: changedSlot,
-            old_status: oldStatus,
-            new_status: newStatus,
-            occupancy,
-          });
-
-          console.log(
-            `🔄 Slot ${changedSlot}: ${oldStatus} → ${newStatus} (spot ${spot_id}, confidence: ${
-              (occupancy &&
-                occupancy.slots &&
-                occupancy.slots[String(changedSlot)] &&
-                occupancy.slots[String(changedSlot)].confidence) ||
-              0
-            })`,
-          );
-        }
-      } catch (error) {
-        console.error(
-          "❌ Frame processing error:",
-          error?.response?.data || error.message || error,
-        );
-        socket.emit("error", { message: "Frame processing failed" });
-      }
-    });
-
-    socket.on("disconnect", () => {
-      console.log(`🔌 Client disconnected: ${socket.id}`);
-    });
+  // Join room for specific parking spot
+  socket.on("join_spot", (spotId) => {
+    socket.join(`spot_${spotId}`);
+    console.log(`📍 User ${socket.user.id} joined spot ${spotId} room`);
   });
-}
 
-// Start Socket.IO handling
-setupSocketIO(io, activeSessions);
+  // Leave room
+  socket.on("leave_spot", (spotId) => {
+    socket.leave(`spot_${spotId}`);
+    console.log(`📍 User ${socket.user.id} left spot ${spotId} room`);
+  });
+
+  // Handle disconnect
+  socket.on("disconnect", () => {
+    console.log(`🔌 Client disconnected: ${socket.id}`);
+  });
+});
+
+// --- Set Socket.IO instance for AI routes ---
+aiRoutes.setSocketIO(io);
 
 // --- Exports (if other modules should interact) ---
 module.exports = {
-  setupSocketIO,
   activeSessions,
   io,
   db,
+  app,
+  server,
 };
 
 // --- Start server ---
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log("=".repeat(60));
+  console.log(`🚀 Backend server running on port ${PORT}`);
+  console.log(`🔌 Socket.IO ready for real-time updates`);
+  console.log(`🎥 Camera worker system enabled`);
+  console.log("=".repeat(60));
+});

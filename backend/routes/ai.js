@@ -1,17 +1,29 @@
-// backend/routes/ai.js - Integrated with Python AI Server (chalja.py)
 const express = require("express");
 const router = express.Router();
 const db = require("../config/db");
 const auth = require("../middleware/authMiddleware");
 const axios = require("axios");
+const MjpegProxy = require("mjpeg-proxy").MjpegProxy;
 
-// Use the shared activeSessions map so server sockets and routes share the same state
 const activeSessions = require("../activeSessions");
+const {
+  startCameraWorker,
+  stopCameraWorker,
+  getWorkerStatus,
+} = require("./cameraWorker");
 
 const PYTHON_AI_SERVER =
   process.env.PYTHON_AI_SERVER || "http://localhost:5001";
 
-// Health check for Python AI server
+// Store io instance (set by server.js)
+let io = null;
+function setSocketIO(socketIO) {
+  io = socketIO;
+}
+
+/**
+ * Health check for Python AI server
+ */
 router.get("/python-health", auth(["owner"]), async (req, res) => {
   try {
     const response = await axios.get(`${PYTHON_AI_SERVER}/health`, {
@@ -30,7 +42,46 @@ router.get("/python-health", auth(["owner"]), async (req, res) => {
   }
 });
 
-// Toggle AI Mode
+/**
+ * Get saved AI camera configuration for a parking spot
+ */
+router.get("/config/:spot_id", auth(["owner"]), (req, res) => {
+  const { spot_id } = req.params;
+
+  db.query(
+    `SELECT * FROM ai_camera_config WHERE parking_spot_id = ?`,
+    [spot_id],
+    (err, rows) => {
+      if (err) {
+        return res.status(500).json({ error: err.message });
+      }
+
+      if (!rows || rows.length === 0) {
+        return res.json({
+          success: true,
+          config: null,
+          message: "No configuration found",
+        });
+      }
+
+      const config = rows[0];
+      res.json({
+        success: true,
+        config: {
+          mode: config.mode,
+          camera_url: config.camera_url,
+          grid_config: config.grid_config,
+          scan_interval: config.scan_interval,
+          last_calibrated: config.last_calibrated,
+        },
+      });
+    },
+  );
+});
+
+/**
+ * Toggle AI Mode
+ */
 router.post("/toggle-mode/:spot_id", auth(["owner"]), (req, res) => {
   const { spot_id } = req.params;
   const { mode } = req.body;
@@ -65,29 +116,46 @@ router.post("/toggle-mode/:spot_id", auth(["owner"]), (req, res) => {
   );
 });
 
-// Save Grid Configuration
+/**
+ * Save Grid Configuration
+ */
 router.post("/save-grid-config/:spot_id", auth(["owner"]), (req, res) => {
   const { spot_id } = req.params;
   const { grid_config } = req.body;
+
+  console.log(`💾 Saving grid config for spot ${spot_id}`);
+  console.log(`📹 Camera URL from grid_config:`, grid_config?.camera_url);
 
   if (!grid_config || !Array.isArray(grid_config.cells)) {
     return res.status(400).json({ message: "Invalid grid_config" });
   }
 
   const gridJson = JSON.stringify(grid_config);
+  const cameraUrl = grid_config.camera_url || null;
+
+  console.log(`🔗 Camera URL to save:`, cameraUrl);
+
   db.query(
-    `INSERT INTO ai_camera_config (parking_spot_id, grid_config, last_calibrated)
-     VALUES (?, ?, NOW())
-     ON DUPLICATE KEY UPDATE grid_config = ?, last_calibrated = NOW()`,
-    [spot_id, gridJson, gridJson],
+    `INSERT INTO ai_camera_config (parking_spot_id, grid_config, last_calibrated, camera_url)
+     VALUES (?, ?, NOW(), ?)
+     ON DUPLICATE KEY UPDATE grid_config = ?, last_calibrated = NOW(), camera_url = ?`,
+    [spot_id, gridJson, cameraUrl, gridJson, cameraUrl],
     (err) => {
-      if (err) return res.status(500).json({ error: err.message });
+      if (err) {
+        console.error(`❌ Error saving grid config:`, err.message);
+        return res.status(500).json({ error: err.message });
+      }
+      console.log(
+        `✅ Grid configuration saved successfully for spot ${spot_id}`,
+      );
       res.json({ message: "Grid configuration saved" });
     },
   );
 });
 
-// Detect Grid - Auto-detect parking grid from frame
+/**
+ * Detect Grid - Auto-detect parking grid from frame
+ */
 router.post("/detect-grid", auth(["owner"]), async (req, res) => {
   const { frame, aoi } = req.body;
 
@@ -128,14 +196,23 @@ router.post("/detect-grid", auth(["owner"]), async (req, res) => {
   }
 });
 
-// Start AI Detection - Initialize Python AI server
+/**
+ * Start AI Detection - Backend-owned camera
+ */
 router.post("/start-detection", auth(["owner"]), async (req, res) => {
-  const { parking_spot_id, grid_config, auto_detect_grid } = req.body;
+  const { parking_spot_id, grid_config } = req.body;
 
   if (!parking_spot_id) {
     return res.status(400).json({
       success: false,
       message: "Missing parking_spot_id",
+    });
+  }
+
+  if (!grid_config || !grid_config.camera_url) {
+    return res.status(400).json({
+      success: false,
+      message: "Missing grid_config or camera_url",
     });
   }
 
@@ -155,7 +232,7 @@ router.post("/start-detection", auth(["owner"]), async (req, res) => {
         slot_mapping[String(slot.slot_number)] = slot.slot_id;
       });
 
-      // Initialize Python AI server
+      // Initialize Python AI server session
       try {
         const response = await axios.post(
           `${PYTHON_AI_SERVER}/start-detection`,
@@ -163,13 +240,12 @@ router.post("/start-detection", auth(["owner"]), async (req, res) => {
             parking_spot_id,
             grid_config,
             slot_mapping,
-            auto_detect_grid: auto_detect_grid !== false,
           },
           { timeout: 10000 },
         );
 
         if (response.data.success) {
-          // Store session in shared activeSessions map (so socket handler sees it)
+          // Store session in Node.js
           activeSessions.set(parking_spot_id, {
             grid_config,
             slot_mapping,
@@ -178,15 +254,30 @@ router.post("/start-detection", auth(["owner"]), async (req, res) => {
             num_slots: response.data.num_slots,
           });
 
+          // 🚀 START CAMERA WORKER (Backend owns camera now)
+          if (!io) {
+            return res.status(500).json({
+              success: false,
+              message: "Socket.IO not initialized",
+            });
+          }
+
+          startCameraWorker({
+            spotId: parking_spot_id,
+            cameraUrl: grid_config.camera_url,
+            pythonServer: PYTHON_AI_SERVER,
+            io: io,
+          });
+
           console.log(
             `✅ Detection started for spot ${parking_spot_id} with ${response.data.num_slots} slots`,
           );
+
           res.json({
             success: true,
             message: "Detection started",
             session_id: parking_spot_id,
             num_slots: response.data.num_slots,
-            auto_detect: response.data.auto_detect,
           });
         } else {
           res.status(500).json({
@@ -208,7 +299,9 @@ router.post("/start-detection", auth(["owner"]), async (req, res) => {
   }
 });
 
-// Stop AI Detection
+/**
+ * Stop AI Detection
+ */
 router.post("/stop-detection", auth(["owner"]), async (req, res) => {
   const { parking_spot_id } = req.body;
 
@@ -221,6 +314,7 @@ router.post("/stop-detection", auth(["owner"]), async (req, res) => {
   }
 
   try {
+    // Stop Python AI session
     try {
       await axios.post(
         `${PYTHON_AI_SERVER}/stop-detection`,
@@ -235,8 +329,12 @@ router.post("/stop-detection", auth(["owner"]), async (req, res) => {
       );
     }
 
-    // remove from shared active sessions
+    // Stop camera worker
+    stopCameraWorker(parking_spot_id);
+
+    // Remove session
     activeSessions.delete(parking_spot_id);
+
     console.log(`⏹️ Detection stopped for spot ${parking_spot_id}`);
 
     res.json({
@@ -252,21 +350,86 @@ router.post("/stop-detection", auth(["owner"]), async (req, res) => {
   }
 });
 
-// Get AI Status
+/**
+ * Get AI Status (for auto-resume)
+ */
 router.get("/status/:spot_id", auth(["owner"]), (req, res) => {
   const { spot_id } = req.params;
+  const session = activeSessions.get(parseInt(spot_id));
+  const isRunning = getWorkerStatus(parseInt(spot_id));
 
-  db.query(
-    `SELECT ac.*, ass.is_running, ass.fps, ass.last_heartbeat
-     FROM ai_camera_config ac
-     LEFT JOIN ai_system_status ass ON ac.parking_spot_id = ass.parking_spot_id
-     WHERE ac.parking_spot_id = ?`,
-    [spot_id],
-    (err, result) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(result[0] || { mode: "manual" });
-    },
-  );
+  res.json({
+    is_running: isRunning && !!session,
+    started_at: session?.started_at || null,
+    num_slots: session?.num_slots || 0,
+    has_worker: isRunning,
+  });
+});
+
+/**
+ * MJPEG Stream Proxy - Allows React to view live camera feed
+ */
+router.get("/stream/:spot_id", auth(["owner"]), (req, res) => {
+  const { spot_id } = req.params;
+  const session = activeSessions.get(parseInt(spot_id));
+
+  console.log(`📹 Stream request for spot ${spot_id}`);
+  console.log(`🔍 Active session exists: ${!!session}`);
+
+  // Try to get camera URL from active session first
+  if (session && session.grid_config && session.grid_config.camera_url) {
+    const cameraUrl = session.grid_config.camera_url;
+    console.log(`✅ Using camera URL from active session: ${cameraUrl}`);
+
+    // Create MJPEG proxy - it handles headers automatically
+    const proxy = new MjpegProxy(cameraUrl);
+    proxy.proxyRequest(req, res);
+
+    req.on("close", () => {
+      // MjpegProxy doesn't have destroy method - cleanup handled internally
+      console.log(`📹 Stream closed for spot ${spot_id}`);
+    });
+  } else {
+    // No active session - fetch camera URL from database
+    console.log(`📂 Fetching camera URL from database for spot ${spot_id}`);
+    db.query(
+      `SELECT camera_url FROM ai_camera_config WHERE parking_spot_id = ?`,
+      [spot_id],
+      (err, rows) => {
+        if (err) {
+          console.error(`❌ Database error:`, err.message);
+          return res.status(500).json({ error: err.message });
+        }
+
+        console.log(`📊 Database query result:`, rows);
+
+        if (!rows || rows.length === 0 || !rows[0].camera_url) {
+          console.error(`❌ No camera URL found for spot ${spot_id}`);
+          return res.status(404).json({
+            error: "Camera URL not configured for this parking spot",
+            debug: {
+              rows,
+              hasRows: rows?.length > 0,
+              cameraUrl: rows?.[0]?.camera_url,
+            },
+          });
+        }
+
+        const cameraUrl = rows[0].camera_url;
+        console.log(`✅ Using camera URL from database: ${cameraUrl}`);
+
+        // Create MJPEG proxy - it handles headers automatically
+        const proxy = new MjpegProxy(cameraUrl);
+        proxy.proxyRequest(req, res);
+
+        req.on("close", () => {
+          // MjpegProxy doesn't have destroy method - cleanup handled internally
+          console.log(`📹 Stream closed for spot ${spot_id}`);
+        });
+      },
+    );
+  }
 });
 
 module.exports = router;
+module.exports.setSocketIO = setSocketIO;

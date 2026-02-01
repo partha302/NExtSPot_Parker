@@ -17,8 +17,10 @@
     "dotenv": "^17.2.3",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.2",
+    "mjpeg-consumer": "^2.0.0",
+    "mjpeg-proxy": "^0.3.0",
     "mysql2": "^3.15.3",
-    "socket.io": "^4.8.1",
+    "socket.io": "^4.8.3",
     "socket.io-client": "^4.8.1"
   }
 }

@@ -11,7 +11,6 @@ import {
   Sliders,
 } from "lucide-react";
 import { useParams, useNavigate } from "react-router-dom";
-import AICameraSetup from "./AICameraSetup";
 
 const getSlotStatusColor = (slot) => {
   if (slot.status === "disabled")
@@ -241,7 +240,6 @@ function SlotManagement() {
   const [selectedSlots, setSelectedSlots] = useState([]);
   const [rangeStart, setRangeStart] = useState("");
   const [rangeEnd, setRangeEnd] = useState("");
-  const [showAISetup, setShowAISetup] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState(null);
   const [forceResetConfirm, setForceResetConfirm] = useState(false);
@@ -311,18 +309,6 @@ function SlotManagement() {
     const interval = setInterval(fetchData, 3000);
     return () => clearInterval(interval);
   }, [fetchData]);
-
-  useEffect(() => {
-    try {
-      const wasOpenKey = `aiCamera_was_open_${spotId}`;
-      const wasOpen = sessionStorage.getItem(wasOpenKey) === "true";
-      if (wasOpen) {
-        setShowAISetup(true);
-      }
-    } catch (err) {
-      console.error("Error checking AI modal session state:", err);
-    }
-  }, [spotId]);
 
   useEffect(() => {
     if (message) {
@@ -734,7 +720,7 @@ function SlotManagement() {
             </button>
 
             <button
-              onClick={() => setShowAISetup(true)}
+              onClick={() => navigate(`/owner/ai-setup/${spotId}`)}
               style={{
                 padding: "8px 16px",
                 background: "#3B82F6",
@@ -750,7 +736,7 @@ function SlotManagement() {
               }}
             >
               <Sliders size={16} />
-              AI Optimization
+              AI Detect
             </button>
 
             <button
@@ -1997,41 +1983,6 @@ function SlotManagement() {
                 Force Reset
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* AI Setup Modal */}
-      {showAISetup && (
-        <div
-          style={{
-            position: "fixed",
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: "rgba(0,0,0,0.5)",
-            zIndex: 10000,
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-          }}
-        >
-          <div
-            style={{
-              background: "white",
-              borderRadius: "12px",
-              maxWidth: "1400px",
-              width: "90%",
-              maxHeight: "90vh",
-              overflow: "auto",
-            }}
-          >
-            <AICameraSetup
-              spotId={spotId}
-              totalSlots={slots.length}
-              onClose={() => setShowAISetup(false)}
-            />
           </div>
         </div>
       )}
