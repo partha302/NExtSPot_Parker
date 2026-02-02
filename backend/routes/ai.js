@@ -80,6 +80,69 @@ router.get("/config/:spot_id", auth(["owner"]), (req, res) => {
 });
 
 /**
+ * Save Camera URL
+ */
+router.post("/save-camera-url/:spot_id", auth(["owner"]), (req, res) => {
+  const { spot_id } = req.params;
+  const { camera_url } = req.body;
+
+  console.log(`💾 Saving camera URL for spot ${spot_id}:`, camera_url);
+
+  if (!camera_url) {
+    return res.status(400).json({ message: "Camera URL is required" });
+  }
+
+  db.query(
+    `INSERT INTO ai_camera_config (parking_spot_id, camera_url)
+     VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE camera_url = ?`,
+    [spot_id, camera_url, camera_url],
+    (err) => {
+      if (err) {
+        console.error(`❌ Error saving camera URL:`, err.message);
+        return res.status(500).json({ error: err.message });
+      }
+      console.log(`✅ Camera URL saved successfully for spot ${spot_id}`);
+      res.json({ success: true, message: "Camera URL saved", camera_url });
+    },
+  );
+});
+
+/**
+ * Get previously used camera URLs for a parking spot
+ */
+router.get("/previous-urls/:spot_id", auth(["owner"]), (req, res) => {
+  const { spot_id } = req.params;
+
+  db.query(
+    `SELECT DISTINCT camera_url FROM ai_camera_config 
+     WHERE parking_spot_id = ? AND camera_url IS NOT NULL AND camera_url != ''
+     LIMIT 10`,
+    [spot_id],
+    (err, rows) => {
+      if (err) {
+        console.error(`❌ Error fetching previous URLs:`, err.message);
+        return res.status(500).json({ success: false, error: err.message });
+      }
+
+      const urls = rows
+        ? rows.map((row) => row.camera_url).filter(Boolean)
+        : [];
+      console.log(
+        `📚 Found ${urls.length} previous camera URLs for spot ${spot_id}:`,
+        urls,
+      );
+
+      res.json({
+        success: true,
+        urls: urls,
+        message: `Found ${urls.length} previous URLs`,
+      });
+    },
+  );
+});
+
+/**
  * Toggle AI Mode
  */
 router.post("/toggle-mode/:spot_id", auth(["owner"]), (req, res) => {
@@ -149,6 +212,28 @@ router.post("/save-grid-config/:spot_id", auth(["owner"]), (req, res) => {
         `✅ Grid configuration saved successfully for spot ${spot_id}`,
       );
       res.json({ message: "Grid configuration saved" });
+    },
+  );
+});
+
+/**
+ * Clear Grid Config - Delete grid configuration from database
+ */
+router.delete("/clear-grid-config/:spot_id", auth(["owner"]), (req, res) => {
+  const { spot_id } = req.params;
+
+  console.log(`🗑️ Clearing grid config for spot ${spot_id}`);
+
+  db.query(
+    `UPDATE ai_camera_config SET grid_config = NULL WHERE parking_spot_id = ?`,
+    [spot_id],
+    (err, result) => {
+      if (err) {
+        console.error(`❌ Error clearing grid config:`, err.message);
+        return res.status(500).json({ error: err.message });
+      }
+      console.log(`✅ Grid configuration cleared for spot ${spot_id}`);
+      res.json({ message: "Grid configuration cleared" });
     },
   );
 });

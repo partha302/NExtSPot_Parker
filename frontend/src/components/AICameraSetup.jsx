@@ -11,6 +11,7 @@ import {
   ArrowLeft,
 } from "lucide-react";
 import { io } from "socket.io-client";
+import API from "../api/api";
 
 function AICameraSetup() {
   // Get spotId from URL params
@@ -31,6 +32,7 @@ function AICameraSetup() {
   const [showIpModal, setShowIpModal] = useState(false);
   const [ipInputValue, setIpInputValue] = useState("");
   const [cameraUrl, setCameraUrl] = useState("");
+  const [previousCameraUrls, setPreviousCameraUrls] = useState([]);
 
   // Drawing state
   const [isFrozen, setIsFrozen] = useState(false);
@@ -83,11 +85,12 @@ function AICameraSetup() {
         if (configData.success && configData.config) {
           const cfg = configData.config;
 
-          // Restore camera URL
-          if (cfg.camera_url) {
-            setCameraUrl(cfg.camera_url);
-            console.log("📹 Camera URL restored:", cfg.camera_url);
-          }
+          // ⚠️ DO NOT restore camera URL - IP addresses change frequently
+          // User must manually configure camera URL each session
+          // if (cfg.camera_url) {
+          //   setCameraUrl(cfg.camera_url);
+          //   console.log("📹 Camera URL restored:", cfg.camera_url);
+          // }
 
           // Restore mode
           if (cfg.mode) {
@@ -241,12 +244,40 @@ function AICameraSetup() {
 
   // --- IP CAMERA SETUP ---
 
-  const startIPWebcam = () => {
+  const startIPWebcam = async () => {
     setIpInputValue("");
     setShowIpModal(true);
+
+    // Fetch previous camera URLs from database
+    try {
+      console.log(`🔍 Fetching previous URLs for spot ${spotId}...`);
+      const response = await fetch(
+        `${BACKEND_SERVER}/api/ai/previous-urls/${spotId}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      );
+      const data = await response.json();
+      console.log("📡 API Response:", data);
+
+      if (data.success && Array.isArray(data.urls)) {
+        console.log(`✅ Loaded ${data.urls.length} previous URLs:`, data.urls);
+        setPreviousCameraUrls(data.urls);
+      } else {
+        console.warn("⚠️ No URLs in response or invalid format:", data);
+        setPreviousCameraUrls([]);
+      }
+    } catch (error) {
+      console.error("❌ Failed to fetch previous URLs:", error);
+      setPreviousCameraUrls([]);
+    }
   };
 
-  const handleIpSubmit = () => {
+  const selectPreviousUrl = (url) => {
+    setIpInputValue(url);
+  };
+
+  const handleIpSubmit = async () => {
     let url = ipInputValue.trim();
     if (!url) {
       setMessage("⚠️ Please enter a valid IP address");
@@ -264,9 +295,38 @@ function AICameraSetup() {
     }
 
     console.log("📹 Camera URL configured:", url);
-    setCameraUrl(url);
-    setShowIpModal(false);
-    setMessage("📹 Camera URL configured");
+
+    // Save to database immediately
+    try {
+      const response = await fetch(
+        `${BACKEND_SERVER}/api/ai/save-camera-url/${spotId}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ camera_url: url }),
+        },
+      );
+
+      const data = await response.json();
+
+      if (response.ok && data.success) {
+        setCameraUrl(url);
+        setShowIpModal(false);
+        setMessage("✅ Camera URL saved to database");
+        console.log("✅ Camera URL saved to database:", url);
+      } else {
+        setMessage(
+          "⚠️ Failed to save camera URL: " + (data.message || "Unknown error"),
+        );
+        console.error("Failed to save camera URL:", data);
+      }
+    } catch (error) {
+      setMessage("❌ Error saving camera URL: " + error.message);
+      console.error("Error saving camera URL:", error);
+    }
   };
 
   // --- FREEZE FRAME ---
@@ -322,7 +382,24 @@ function AICameraSetup() {
     setAoiRect(null);
     setAoiMode(false);
     setMessage("🗑️ AOI cleared");
-    redrawRectangles();
+    // Redraw without AOI - need to do this after state update
+    setTimeout(() => {
+      const canvas = drawingCanvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // Redraw only the slots
+        (drawnRectangles || []).forEach((slot, index) => {
+          const [x1, y1, x2, y2] = slot.bbox;
+          ctx.strokeStyle = "#10B981";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          ctx.fillStyle = "#10B981";
+          ctx.font = "bold 24px Arial";
+          ctx.fillText(`#${index + 1}`, x1 + 10, y1 + 30);
+        });
+      }
+    }, 0);
   };
 
   // --- SLOT DRAWING ---
@@ -476,8 +553,9 @@ function AICameraSetup() {
       ctx.fillText("AOI", x1 + 10, y1 + 30);
     }
 
-    // Draw slots
-    rects.forEach((slot, index) => {
+    // Draw slots - ensure rects is always an array
+    const safeRects = rects || [];
+    safeRects.forEach((slot, index) => {
       const [x1, y1, x2, y2] = slot.bbox;
       ctx.strokeStyle = "#10B981";
       ctx.lineWidth = 3;
@@ -504,12 +582,60 @@ function AICameraSetup() {
     if (drawnRectangles.length === 0) return;
     setDrawnRectangles(drawnRectangles.slice(0, -1));
     setMessage(`🗑️ Deleted slot ${drawnRectangles.length}`);
+    // Redraw canvas
+    setTimeout(() => {
+      const canvas = drawingCanvasRef.current;
+      if (canvas) {
+        const ctx = canvas.getContext("2d");
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // Redraw AOI
+        if (aoiRect) {
+          const { x1, y1, x2, y2 } = aoiRect;
+          ctx.strokeStyle = "#FFFF00";
+          ctx.lineWidth = 4;
+          ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          ctx.fillStyle = "#FFFF00";
+          ctx.font = "bold 20px Arial";
+          ctx.fillText("AOI", x1 + 10, y1 + 30);
+        }
+        // Redraw remaining slots (minus last one)
+        const remaining = drawnRectangles.slice(0, -1);
+        remaining.forEach((slot, index) => {
+          const [x1, y1, x2, y2] = slot.bbox;
+          ctx.strokeStyle = "#10B981";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+          ctx.fillStyle = "#10B981";
+          ctx.font = "bold 24px Arial";
+          ctx.fillText(`#${index + 1}`, x1 + 10, y1 + 30);
+        });
+      }
+    }, 0);
   };
 
-  const clearAllRectangles = () => {
+  const clearAllRectangles = async () => {
     setDrawnRectangles([]);
-    setMessage("🗑️ All slots cleared");
-    redrawRectangles([]);
+    setGridConfig(null); // Also clear grid config
+    setAoiRect(null); // Clear AOI too
+    setMessage("🗑️ All slots and AOI cleared");
+
+    // Clear canvas
+    const canvas = drawingCanvasRef.current;
+    if (canvas) {
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
+
+    // Also clear from database so it doesn't reload on page refresh
+    try {
+      await API.delete(`/ai/clear-grid-config/${spotId}`);
+      console.log("✅ Grid config cleared from database");
+    } catch (err) {
+      console.warn(
+        "⚠️ Could not clear grid config from database:",
+        err.message,
+      );
+    }
   };
 
   // --- AUTO-DETECT GRID ---
@@ -989,11 +1115,15 @@ function AICameraSetup() {
               backgroundColor: "#ffffff",
               borderRadius: "16px",
               padding: "24px",
-              width: "400px",
+              width: "420px",
+              maxHeight: "80vh",
+              overflowY: "auto",
             }}
             onClick={(e) => e.stopPropagation()}
           >
-            <h3>Connect IP Webcam</h3>
+            <h3 style={{ marginTop: 0, marginBottom: "16px" }}>
+              Connect IP Webcam
+            </h3>
             <input
               type="text"
               value={ipInputValue}
@@ -1008,9 +1138,77 @@ function AICameraSetup() {
                 border: "1px solid #e5e7eb",
                 borderRadius: "8px",
                 marginBottom: "16px",
+                boxSizing: "border-box",
+                fontSize: "14px",
               }}
               autoFocus
             />
+
+            {/* Previous URLs */}
+            {previousCameraUrls.length > 0 && (
+              <div style={{ marginBottom: "16px" }}>
+                <label
+                  style={{
+                    display: "block",
+                    fontSize: "12px",
+                    fontWeight: "600",
+                    color: "#6b7280",
+                    marginBottom: "8px",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.5px",
+                  }}
+                >
+                  📚 Previously Used URLs
+                </label>
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                  }}
+                >
+                  {previousCameraUrls.map((url, idx) => (
+                    <button
+                      key={idx}
+                      onClick={() => selectPreviousUrl(url)}
+                      style={{
+                        padding: "10px 12px",
+                        backgroundColor:
+                          ipInputValue === url ? "#dbeafe" : "#f3f4f6",
+                        border:
+                          ipInputValue === url
+                            ? "2px solid #3b82f6"
+                            : "1px solid #e5e7eb",
+                        borderRadius: "8px",
+                        cursor: "pointer",
+                        textAlign: "left",
+                        fontSize: "13px",
+                        color: "#374151",
+                        fontFamily: "monospace",
+                        transition: "all 0.2s",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.backgroundColor = "#eff6ff";
+                        e.currentTarget.style.borderColor = "#3b82f6";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.backgroundColor =
+                          ipInputValue === url ? "#dbeafe" : "#f3f4f6";
+                        e.currentTarget.style.borderColor =
+                          ipInputValue === url ? "#3b82f6" : "#e5e7eb";
+                      }}
+                      title={url}
+                    >
+                      ✓ {url}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             <div style={{ display: "flex", gap: "8px" }}>
               <button
                 onClick={() => setShowIpModal(false)}
@@ -1207,10 +1405,12 @@ function AICameraSetup() {
               </button>
               <button
                 onClick={clearAllRectangles}
-                disabled={drawnRectangles.length === 0}
+                disabled={
+                  drawnRectangles.length === 0 && !aoiRect && !gridConfig
+                }
                 style={{
                   ...styles.button,
-                  ...(drawnRectangles.length === 0
+                  ...(drawnRectangles.length === 0 && !aoiRect && !gridConfig
                     ? styles.buttonDisabled
                     : styles.buttonDanger),
                 }}
@@ -1268,6 +1468,10 @@ function AICameraSetup() {
                 src={processedFrame}
                 alt="AI Processed Stream"
                 style={{
+                  position: "absolute",
+                  top: "50%",
+                  left: "50%",
+                  transform: "translate(-50%, -50%)",
                   maxWidth: "100%",
                   maxHeight: "100%",
                   width: "auto",
@@ -1277,32 +1481,38 @@ function AICameraSetup() {
               />
             )}
 
-            {/* Live Stream - show when: not frozen AND (not detecting OR detecting but no processed frame yet) */}
-            {cameraUrl &&
-              !isFrozen &&
-              (!isDetecting || (isDetecting && !processedFrame)) && (
-                <img
-                  ref={videoRef}
-                  src={STREAM_URL}
-                  alt="Live Stream"
-                  crossOrigin="anonymous"
-                  style={{
-                    maxWidth: "100%",
-                    maxHeight: "100%",
-                    width: "auto",
-                    height: "auto",
-                    objectFit: "contain",
-                  }}
-                  onLoad={() => {
-                    if (drawingCanvasRef.current && videoRef.current) {
-                      const w = videoRef.current.naturalWidth || 1280;
-                      const h = videoRef.current.naturalHeight || 720;
-                      drawingCanvasRef.current.width = w;
-                      drawingCanvasRef.current.height = h;
-                    }
-                  }}
-                />
-              )}
+            {/* Live Stream - keep mounted but hide when frozen or when processed frame is shown */}
+            {cameraUrl && (
+              <img
+                ref={videoRef}
+                src={STREAM_URL}
+                alt="Live Stream"
+                crossOrigin="anonymous"
+                style={{
+                  position: "absolute",
+                  top: "50%",
+                  left: "50%",
+                  transform: "translate(-50%, -50%)",
+                  maxWidth: "100%",
+                  maxHeight: "100%",
+                  width: "auto",
+                  height: "auto",
+                  objectFit: "contain",
+                  display:
+                    isFrozen || (isDetecting && processedFrame)
+                      ? "none"
+                      : "block",
+                }}
+                onLoad={() => {
+                  if (drawingCanvasRef.current && videoRef.current) {
+                    const w = videoRef.current.naturalWidth || 1280;
+                    const h = videoRef.current.naturalHeight || 720;
+                    drawingCanvasRef.current.width = w;
+                    drawingCanvasRef.current.height = h;
+                  }
+                }}
+              />
+            )}
 
             {/* Frozen Frame */}
             {isFrozen && frozenImage && (
@@ -1311,6 +1521,10 @@ function AICameraSetup() {
                   src={frozenImage}
                   alt="Frozen"
                   style={{
+                    position: "absolute",
+                    top: "50%",
+                    left: "50%",
+                    transform: "translate(-50%, -50%)",
                     maxWidth: "100%",
                     maxHeight: "100%",
                     width: "auto",

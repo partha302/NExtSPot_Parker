@@ -110,10 +110,66 @@ def encode_frame_to_base64(frame_bgr: np.ndarray, quality: int = 85) -> str:
         return ""
 
 
+def preprocess_for_detection(frame_bgr: np.ndarray) -> np.ndarray:
+    """
+    🎨 COLOR-AGNOSTIC PREPROCESSING
+    
+    Enhances the image to make grid lines/borders more visible regardless of color.
+    Works with red, blue, black, or any color ink/marker.
+    
+    Techniques:
+    1. CLAHE (Contrast Limited Adaptive Histogram Equalization) for local contrast
+    2. Edge enhancement to make borders stand out
+    3. Saturation boost to make colored lines more visible
+    """
+    try:
+        # Make a copy to avoid modifying original
+        enhanced = frame_bgr.copy()
+        
+        # Method 1: Apply CLAHE to L channel in LAB color space
+        # This enhances local contrast without color distortion
+        lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        
+        # Apply CLAHE to L channel
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        l_enhanced = clahe.apply(l_channel)
+        
+        # Merge back
+        lab_enhanced = cv2.merge([l_enhanced, a_channel, b_channel])
+        enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+        
+        # Method 2: Boost saturation to make colored lines pop
+        hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
+        h, s, v = cv2.split(hsv)
+        
+        # Boost saturation (helps colored ink stand out)
+        s_boosted = cv2.convertScaleAbs(s, alpha=1.3, beta=10)
+        
+        hsv_enhanced = cv2.merge([h, s_boosted, v])
+        enhanced = cv2.cvtColor(hsv_enhanced, cv2.COLOR_HSV2BGR)
+        
+        # Method 3: Slight sharpening to enhance edges
+        kernel = np.array([[-0.5, -0.5, -0.5],
+                          [-0.5,  5.0, -0.5],
+                          [-0.5, -0.5, -0.5]])
+        enhanced = cv2.filter2D(enhanced, -1, kernel)
+        
+        # Clip values to valid range
+        enhanced = np.clip(enhanced, 0, 255).astype(np.uint8)
+        
+        print("🎨 Applied color-agnostic preprocessing (CLAHE + saturation boost + sharpening)")
+        return enhanced
+        
+    except Exception as e:
+        print(f"⚠️ Preprocessing error (using original): {e}")
+        return frame_bgr
+
+
 def detect_grid_static_approach(
     frame_bgr: np.ndarray,
     aoi_absolute: Optional[Tuple[int, int, int, int]] = None,
-    conf_thresh: float = 0.20,
+    conf_thresh: float = 0.15,  # Lowered default threshold for better recall
     imgsz: int = 640
 ) -> Dict:
     """
@@ -121,9 +177,10 @@ def detect_grid_static_approach(
     
     This function:
     1. Crops AOI from frame (if AOI provided)
-    2. Saves cropped region to temp file (just like test.py)
-    3. Runs YOLO on temp file (identical to test.py)
-    4. Translates coordinates back to full frame space
+    2. Applies color-agnostic preprocessing for better detection
+    3. Saves cropped region to temp file (just like test.py)
+    4. Runs YOLO on temp file (identical to test.py)
+    5. Translates coordinates back to full frame space
     
     Args:
         frame_bgr: Full frame in BGR format
@@ -174,23 +231,28 @@ def detect_grid_static_approach(
         else:
             print(f"📐 Using full frame: {frame_bgr.shape[1]}x{frame_bgr.shape[0]}")
         
-        # Step 2: Save to temp file (EXACTLY like test.py)
+        # Step 2: Apply color-agnostic preprocessing for better detection
+        detection_frame = preprocess_for_detection(detection_frame)
+        
+        # Step 3: Save to temp file (EXACTLY like test.py)
         temp_dir = tempfile.gettempdir()
         temp_path = os.path.join(temp_dir, "yolo_grid_detect_frame.png")
         cv2.imwrite(temp_path, detection_frame)
-        print(f"📸 Saved frame to: {temp_path}")
+        print(f"📸 Saved preprocessed frame to: {temp_path}")
         
-        # Step 3: Run YOLO predict on file (EXACTLY like test.py)
-        print(f"🔍 Running YOLO detection (conf={conf_thresh}, imgsz={imgsz})...")
+        # Step 4: Run YOLO predict on file (EXACTLY like test.py)
+        # Lower confidence threshold for better recall
+        effective_conf = max(0.10, conf_thresh - 0.05)  # Slightly lower threshold
+        print(f"🔍 Running YOLO detection (conf={effective_conf}, imgsz={imgsz})...")
         results = YOLO_MODEL.predict(
             source=temp_path,
             imgsz=imgsz,
-            conf=conf_thresh,
+            conf=effective_conf,
             verbose=False,
             save=False
         )
         
-        # Step 4: Extract detections and translate coordinates
+        # Step 5: Extract detections and translate coordinates
         cells_in_aoi = []  # Coordinates relative to AOI
         cells_full_frame = []  # Coordinates relative to full frame
         
