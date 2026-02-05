@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import torch
 from PIL import Image
@@ -1046,6 +1046,21 @@ class DetectionSession:
         self.grid_config = grid_config
         self.reference_frame_size = None
         
+        # USB camera support
+        self.camera_url = grid_config.get('camera_url', '') if grid_config else ''
+        self.is_usb_camera = self.camera_url.startswith('usb:')
+        self.usb_capture = None
+        self.usb_thread = None
+        self.usb_running = False
+        self.latest_frame = None
+        self.frame_lock = None
+        
+        # Initialize USB camera if needed
+        if self.is_usb_camera:
+            import threading
+            self.frame_lock = threading.Lock()
+            self._init_usb_camera()
+        
         # Initialize slot trackers from config
         if grid_config and "cells" in grid_config:
             cells = grid_config["cells"]
@@ -1084,6 +1099,69 @@ class DetectionSession:
             self.grid_locked = True
         else:
             print(f"📊 Session created - waiting for grid configuration")
+    
+    def _init_usb_camera(self):
+        """Initialize USB camera capture."""
+        import threading
+        try:
+            # Extract device index from "usb:0" format
+            device_index = int(self.camera_url.split(':')[1])
+            print(f"🎥 Initializing USB camera at index {device_index}")
+            
+            self.usb_capture = cv2.VideoCapture(device_index)
+            
+            if not self.usb_capture.isOpened():
+                print(f"❌ Failed to open USB camera at index {device_index}")
+                return
+            
+            # Set camera properties for better performance
+            self.usb_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.usb_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.usb_capture.set(cv2.CAP_PROP_FPS, 30)
+            
+            print(f"✅ USB camera initialized successfully")
+            
+            # Start capture thread
+            self.usb_running = True
+            self.usb_thread = threading.Thread(target=self._usb_capture_loop, daemon=True)
+            self.usb_thread.start()
+            print(f"✅ USB camera capture thread started")
+            
+        except Exception as e:
+            print(f"❌ USB camera initialization error: {e}")
+            traceback.print_exc()
+    
+    def _usb_capture_loop(self):
+        """Continuously capture frames from USB camera."""
+        while self.usb_running and self.usb_capture:
+            try:
+                ret, frame = self.usb_capture.read()
+                if ret and frame is not None:
+                    with self.frame_lock:
+                        self.latest_frame = frame.copy()
+                else:
+                    time.sleep(0.01)  # Small delay if read fails
+            except Exception as e:
+                print(f"❌ USB capture error: {e}")
+                time.sleep(0.1)
+    
+    def get_latest_usb_frame(self):
+        """Get the latest frame from USB camera."""
+        if not self.is_usb_camera or self.latest_frame is None:
+            return None
+        with self.frame_lock:
+            return self.latest_frame.copy()
+    
+    def cleanup_usb_camera(self):
+        """Stop USB camera capture and release resources."""
+        if self.is_usb_camera:
+            print(f"🛑 Stopping USB camera for spot {self.spot_id}")
+            self.usb_running = False
+            if self.usb_thread:
+                self.usb_thread.join(timeout=2)
+            if self.usb_capture:
+                self.usb_capture.release()
+            print(f"✅ USB camera released")
     
     def set_reference_frame(self, frame_bgr: np.ndarray):
         """Set reference frame (empty parking lot)."""
@@ -1404,6 +1482,10 @@ def stop_detection():
         spot_id = data.get('parking_spot_id')
         
         if spot_id in active_sessions:
+            session = active_sessions[spot_id]
+            # Clean up USB camera if used
+            if session.is_usb_camera:
+                session.cleanup_usb_camera()
             del active_sessions[spot_id]
             print(f"⏹️ Detection stopped for spot {spot_id}")
             return jsonify({
@@ -1440,21 +1522,32 @@ def process_frame():
         if spot_id not in active_sessions:
             return jsonify({"error": "No active session for this spot"}), 400
         
-        if not frame_b64:
-            return jsonify({"error": "Missing frame data"}), 400
+        session = active_sessions[spot_id]
         
-        # Decode frame
-        frame_bgr = decode_base64_image(frame_b64)
-        
-        if frame_bgr is None:
-            return jsonify({
-                "error": "Failed to decode image",
-                "occupancy": {"slots": {}},
-                "state_change": None
-            }), 400
+        # Handle USB camera - get frame from USB instead of request
+        if session.is_usb_camera:
+            frame_bgr = session.get_latest_usb_frame()
+            if frame_bgr is None:
+                return jsonify({
+                    "error": "No USB camera frame available",
+                    "occupancy": {"slots": {}},
+                    "state_change": None
+                }), 400
+        else:
+            # IP camera - decode frame from request
+            if not frame_b64:
+                return jsonify({"error": "Missing frame data"}), 400
+            
+            frame_bgr = decode_base64_image(frame_b64)
+            
+            if frame_bgr is None:
+                return jsonify({
+                    "error": "Failed to decode image",
+                    "occupancy": {"slots": {}},
+                    "state_change": None
+                }), 400
         
         # Process frame
-        session = active_sessions[spot_id]
         annotated_frame, occupancy, state_change = session.process_frame(frame_bgr, use_ai)
         
         # Build response
@@ -1513,6 +1606,48 @@ def set_reference():
     except Exception as e:
         print(f"❌ Set reference error: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/usb-stream/<int:spot_id>')
+def usb_stream(spot_id):
+    """Stream USB camera frames as MJPEG for a specific parking spot."""
+    def generate_frames():
+        """Generator function that yields MJPEG frames from USB camera."""
+        if spot_id not in active_sessions:
+            print(f"❌ No active session for spot {spot_id}")
+            return
+        
+        session = active_sessions[spot_id]
+        
+        if not session.is_usb_camera:
+            print(f"❌ Spot {spot_id} is not using USB camera")
+            return
+        
+        print(f"📹 Starting USB stream for spot {spot_id}")
+        
+        while spot_id in active_sessions:
+            try:
+                frame = session.get_latest_usb_frame()
+                
+                if frame is not None:
+                    # Encode frame as JPEG
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    frame_bytes = buffer.tobytes()
+                    
+                    # Yield frame in MJPEG format
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                else:
+                    time.sleep(0.01)  # Wait a bit if no frame available
+                    
+            except Exception as e:
+                print(f"❌ USB stream error for spot {spot_id}: {e}")
+                break
+        
+        print(f"🛑 USB stream stopped for spot {spot_id}")
+    
+    return Response(generate_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 # ============================================================

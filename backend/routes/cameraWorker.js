@@ -24,6 +24,120 @@ function startCameraWorker({ spotId, cameraUrl, pythonServer, io }) {
   console.log(`🎥 Starting camera worker for spot ${spotId}`);
   console.log(`📹 Camera URL: ${cameraUrl}`);
 
+  // Check if USB camera - Python handles these directly
+  if (cameraUrl.startsWith("usb:")) {
+    console.log(
+      `📹 USB camera detected - Starting polling loop for Python script`,
+    );
+
+    let running = true;
+    let processedFrameCount = 0;
+    let lastFpsTime = Date.now();
+    let currentFps = 0;
+    let consecutiveErrors = 0;
+    const MAX_RETRIES = 50;
+
+    // Polling function for USB camera
+    const pollUSBCamera = async () => {
+      if (!running) return;
+
+      try {
+        const now = Date.now();
+
+        // Request frame processing from Python (it will use USB camera internally)
+        const response = await axios.post(
+          `${pythonServer}/process-frame`,
+          {
+            spot_id: spotId,
+            timestamp: now,
+          },
+          { timeout: 3000 },
+        );
+
+        processedFrameCount++;
+        consecutiveErrors = 0;
+
+        // Broadcast processed frame with annotations
+        if (response.data.processed_frame) {
+          io.to(`spot_${spotId}`).emit("processed_frame", {
+            spot_id: spotId,
+            frame: response.data.processed_frame,
+            timestamp: response.data.timestamp,
+          });
+        }
+
+        // Broadcast occupancy data
+        if (response.data.occupancy) {
+          io.to(`spot_${spotId}`).emit("occupancy_update", {
+            spot_id: spotId,
+            occupancy: response.data.occupancy,
+            num_slots: response.data.num_slots,
+          });
+        }
+
+        // If state changed, broadcast that too
+        if (response.data.state_change) {
+          io.to(`spot_${spotId}`).emit("state_change", {
+            spot_id: spotId,
+            change: response.data.state_change,
+          });
+        }
+
+        // Calculate FPS
+        if (now - lastFpsTime >= 1000) {
+          currentFps = processedFrameCount;
+          processedFrameCount = 0;
+          lastFpsTime = now;
+
+          // Broadcast FPS
+          io.to(`spot_${spotId}`).emit("fps_update", {
+            spot_id: spotId,
+            fps: currentFps,
+          });
+        }
+      } catch (err) {
+        consecutiveErrors++;
+        console.error(
+          `❌ USB camera polling error [spot ${spotId}]:`,
+          err.message,
+        );
+
+        if (consecutiveErrors > MAX_RETRIES) {
+          console.error(
+            `🛑 Too many errors for spot ${spotId}, stopping worker`,
+          );
+          running = false;
+          stopCameraWorker(spotId);
+
+          io.to(`spot_${spotId}`).emit("camera_error", {
+            spot_id: spotId,
+            message: "USB camera polling failed after multiple retries",
+          });
+          return;
+        }
+      }
+
+      // Continue polling at ~30 FPS
+      if (running) {
+        setTimeout(pollUSBCamera, MIN_FRAME_INTERVAL);
+      }
+    };
+
+    // Start polling
+    pollUSBCamera();
+
+    cameraWorkers.set(spotId, {
+      type: "usb",
+      stopFn: () => {
+        console.log(`🛑 USB camera worker stopped for spot ${spotId}`);
+        running = false;
+      },
+    });
+
+    console.log(`✅ USB camera polling started for spot ${spotId}`);
+    return;
+  }
+
   let running = true;
   let consecutiveErrors = 0;
   const MAX_RETRIES = 50;

@@ -29,6 +29,8 @@ function AICameraSetup() {
   const [isLoading, setIsLoading] = useState(true);
 
   // Camera URL state
+  const [cameraSource, setCameraSource] = useState("ip"); // "ip" or "usb"
+  const [usbDeviceIndex, setUsbDeviceIndex] = useState(0);
   const [showIpModal, setShowIpModal] = useState(false);
   const [ipInputValue, setIpInputValue] = useState("");
   const [cameraUrl, setCameraUrl] = useState("");
@@ -95,6 +97,14 @@ function AICameraSetup() {
           // Restore mode
           if (cfg.mode) {
             setMode(cfg.mode);
+          }
+
+          // Restore camera source
+          if (cfg.camera_source) {
+            setCameraSource(cfg.camera_source);
+          }
+          if (cfg.usb_device_index !== undefined) {
+            setUsbDeviceIndex(cfg.usb_device_index);
           }
 
           // Restore grid config and drawn rectangles
@@ -245,6 +255,7 @@ function AICameraSetup() {
   // --- IP CAMERA SETUP ---
 
   const startIPWebcam = async () => {
+    setCameraSource("ip");
     setIpInputValue("");
     setShowIpModal(true);
 
@@ -306,7 +317,7 @@ function AICameraSetup() {
             "Content-Type": "application/json",
             Authorization: `Bearer ${token}`,
           },
-          body: JSON.stringify({ camera_url: url }),
+          body: JSON.stringify({ camera_url: url, camera_source: "ip" }),
         },
       );
 
@@ -326,6 +337,46 @@ function AICameraSetup() {
     } catch (error) {
       setMessage("❌ Error saving camera URL: " + error.message);
       console.error("Error saving camera URL:", error);
+    }
+  };
+
+  const handleUSBSubmit = async () => {
+    const url = `usb:${usbDeviceIndex}`;
+    console.log("📹 USB Camera configured:", url);
+
+    // Save to database immediately
+    try {
+      const response = await fetch(
+        `${BACKEND_SERVER}/api/ai/save-camera-url/${spotId}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            camera_url: url,
+            camera_source: "usb",
+            usb_device_index: usbDeviceIndex,
+          }),
+        },
+      );
+
+      const data = await response.json();
+
+      if (response.ok && data.success) {
+        setCameraUrl(url);
+        setMessage(`✅ USB Camera (index ${usbDeviceIndex}) configured`);
+        console.log("✅ USB Camera saved to database:", url);
+      } else {
+        setMessage(
+          "⚠️ Failed to save USB camera: " + (data.message || "Unknown error"),
+        );
+        console.error("Failed to save USB camera:", data);
+      }
+    } catch (error) {
+      setMessage("❌ Error saving USB camera: " + error.message);
+      console.error("Error saving USB camera:", error);
     }
   };
 
@@ -1314,14 +1365,82 @@ function AICameraSetup() {
 
           <hr />
 
-          {/* Camera URL */}
-          <h4>📹 Camera</h4>
-          <button
-            onClick={startIPWebcam}
-            style={{ ...styles.button, ...styles.buttonSuccess }}
+          {/* Camera Source Selection */}
+          <h4>📹 Camera Source</h4>
+          <select
+            value={cameraSource}
+            onChange={(e) => setCameraSource(e.target.value)}
+            style={{
+              width: "100%",
+              padding: "10px",
+              border: "1px solid #e5e7eb",
+              borderRadius: "8px",
+              marginBottom: "12px",
+              fontSize: "14px",
+              cursor: "pointer",
+              backgroundColor: "#ffffff",
+            }}
           >
-            <Wifi size={16} /> Configure Camera URL
-          </button>
+            <option value="ip">IP Webcam (Network)</option>
+            <option value="usb">USB Webcam (Local)</option>
+          </select>
+
+          {cameraSource === "ip" ? (
+            <button
+              onClick={startIPWebcam}
+              style={{ ...styles.button, ...styles.buttonSuccess }}
+            >
+              <Wifi size={16} /> Configure IP Camera
+            </button>
+          ) : (
+            <div style={{ marginBottom: "12px" }}>
+              <label
+                style={{
+                  display: "block",
+                  fontSize: "12px",
+                  fontWeight: "600",
+                  color: "#6b7280",
+                  marginBottom: "8px",
+                }}
+              >
+                USB Device Index
+              </label>
+              <input
+                type="number"
+                min="0"
+                max="10"
+                value={usbDeviceIndex}
+                onChange={(e) =>
+                  setUsbDeviceIndex(parseInt(e.target.value) || 0)
+                }
+                style={{
+                  width: "100%",
+                  padding: "10px",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: "8px",
+                  fontSize: "14px",
+                  boxSizing: "border-box",
+                }}
+                placeholder="Usually 0 for default USB camera"
+              />
+              <p
+                style={{
+                  fontSize: "11px",
+                  color: "#6b7280",
+                  marginTop: "6px",
+                  marginBottom: "12px",
+                }}
+              >
+                Usually 0 for the first USB camera, 1 for second, etc.
+              </p>
+              <button
+                onClick={handleUSBSubmit}
+                style={{ ...styles.button, ...styles.buttonSuccess }}
+              >
+                <Wifi size={16} /> Configure USB Camera
+              </button>
+            </div>
+          )}
 
           <hr />
 
@@ -1482,7 +1601,7 @@ function AICameraSetup() {
             )}
 
             {/* Live Stream - keep mounted but hide when frozen or when processed frame is shown */}
-            {cameraUrl && (
+            {cameraUrl && !cameraUrl.startsWith("usb:") && (
               <img
                 ref={videoRef}
                 src={STREAM_URL}
@@ -1512,6 +1631,25 @@ function AICameraSetup() {
                   }
                 }}
               />
+            )}
+
+            {/* USB Camera Message - no preview available */}
+            {cameraUrl && cameraUrl.startsWith("usb:") && !isDetecting && (
+              <div style={{ textAlign: "center", color: "#6b7280" }}>
+                <div style={{ fontSize: "48px", marginBottom: "16px" }}>🎥</div>
+                <div
+                  style={{
+                    fontSize: "18px",
+                    fontWeight: "600",
+                    marginBottom: "8px",
+                  }}
+                >
+                  USB Camera Configured
+                </div>
+                <div style={{ fontSize: "14px", color: "#9ca3af" }}>
+                  Start detection to see the processed frames
+                </div>
+              </div>
             )}
 
             {/* Frozen Frame */}
@@ -1557,7 +1695,7 @@ function AICameraSetup() {
             )}
 
             {/* Freeze Button */}
-            {cameraUrl && !isDetecting && (
+            {cameraUrl && !cameraUrl.startsWith("usb:") && !isDetecting && (
               <button
                 style={styles.freezeButton}
                 onClick={isFrozen ? unfreezeFrame : freezeFrame}

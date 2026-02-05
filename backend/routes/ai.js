@@ -84,26 +84,44 @@ router.get("/config/:spot_id", auth(["owner"]), (req, res) => {
  */
 router.post("/save-camera-url/:spot_id", auth(["owner"]), (req, res) => {
   const { spot_id } = req.params;
-  const { camera_url } = req.body;
+  const { camera_url, camera_source, usb_device_index } = req.body;
 
-  console.log(`💾 Saving camera URL for spot ${spot_id}:`, camera_url);
+  console.log(`💾 Saving camera config for spot ${spot_id}:`, {
+    camera_url,
+    camera_source,
+    usb_device_index,
+  });
 
   if (!camera_url) {
     return res.status(400).json({ message: "Camera URL is required" });
   }
 
+  // Determine camera source if not provided
+  const source =
+    camera_source || (camera_url.startsWith("usb:") ? "usb" : "ip");
+  const deviceIndex = usb_device_index !== undefined ? usb_device_index : 0;
+
   db.query(
-    `INSERT INTO ai_camera_config (parking_spot_id, camera_url)
-     VALUES (?, ?)
-     ON DUPLICATE KEY UPDATE camera_url = ?`,
-    [spot_id, camera_url, camera_url],
+    `INSERT INTO ai_camera_config (parking_spot_id, camera_url, camera_source, usb_device_index)
+     VALUES (?, ?, ?, ?)
+     ON DUPLICATE KEY UPDATE 
+       camera_url = ?, 
+       camera_source = ?,
+       usb_device_index = ?`,
+    [spot_id, camera_url, source, deviceIndex, camera_url, source, deviceIndex],
     (err) => {
       if (err) {
-        console.error(`❌ Error saving camera URL:`, err.message);
+        console.error(`❌ Error saving camera config:`, err.message);
         return res.status(500).json({ error: err.message });
       }
-      console.log(`✅ Camera URL saved successfully for spot ${spot_id}`);
-      res.json({ success: true, message: "Camera URL saved", camera_url });
+      console.log(`✅ Camera config saved successfully for spot ${spot_id}`);
+      res.json({
+        success: true,
+        message: "Camera configuration saved",
+        camera_url,
+        camera_source: source,
+        usb_device_index: deviceIndex,
+      });
     },
   );
 });
@@ -116,7 +134,10 @@ router.get("/previous-urls/:spot_id", auth(["owner"]), (req, res) => {
 
   db.query(
     `SELECT DISTINCT camera_url FROM ai_camera_config 
-     WHERE parking_spot_id = ? AND camera_url IS NOT NULL AND camera_url != ''
+     WHERE parking_spot_id = ? 
+       AND camera_url IS NOT NULL 
+       AND camera_url != ''
+       AND camera_url NOT LIKE 'usb:%'
      LIMIT 10`,
     [spot_id],
     (err, rows) => {
@@ -466,6 +487,28 @@ router.get("/stream/:spot_id", auth(["owner"]), (req, res) => {
     const cameraUrl = session.grid_config.camera_url;
     console.log(`✅ Using camera URL from active session: ${cameraUrl}`);
 
+    // Check if USB camera
+    if (cameraUrl.startsWith("usb:")) {
+      console.log("🔄 Proxying USB camera stream from Python server");
+      const pythonStreamUrl = `${PYTHON_AI_SERVER}/usb-stream/${spot_id}`;
+
+      try {
+        const proxy = new MjpegProxy(pythonStreamUrl);
+        proxy.proxyRequest(req, res);
+
+        req.on("close", () => {
+          console.log(`📹 USB stream closed for spot ${spot_id}`);
+        });
+        return;
+      } catch (err) {
+        console.error(`❌ USB stream proxy error:`, err.message);
+        return res.status(500).json({
+          error: "Failed to proxy USB camera stream",
+          message: err.message,
+        });
+      }
+    }
+
     // Create MJPEG proxy - it handles headers automatically
     const proxy = new MjpegProxy(cameraUrl);
     proxy.proxyRequest(req, res);
@@ -502,6 +545,28 @@ router.get("/stream/:spot_id", auth(["owner"]), (req, res) => {
 
         const cameraUrl = rows[0].camera_url;
         console.log(`✅ Using camera URL from database: ${cameraUrl}`);
+
+        // Check if USB camera
+        if (cameraUrl.startsWith("usb:")) {
+          console.log("🔄 Proxying USB camera stream from Python server");
+          const pythonStreamUrl = `${PYTHON_AI_SERVER}/usb-stream/${spot_id}`;
+
+          try {
+            const proxy = new MjpegProxy(pythonStreamUrl);
+            proxy.proxyRequest(req, res);
+
+            req.on("close", () => {
+              console.log(`📹 USB stream closed for spot ${spot_id}`);
+            });
+            return;
+          } catch (err) {
+            console.error(`❌ USB stream proxy error:`, err.message);
+            return res.status(500).json({
+              error: "Failed to proxy USB camera stream",
+              message: err.message,
+            });
+          }
+        }
 
         // Create MJPEG proxy - it handles headers automatically
         const proxy = new MjpegProxy(cameraUrl);
